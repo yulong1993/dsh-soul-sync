@@ -360,6 +360,68 @@ test('bin/dsh-soul.js CLI --platform flag overrides io.platform and rejects inva
   assert.match(badIo.getStderr(), /--platform/);
 });
 
+test('bin/dsh-soul.js CLI step-sync flags (--no-step-sync / --step-sync / config stepSync=off) & INSTALL_PROMPT.md presence', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'cli-step-sync');
+  const dshHome = path.join(caseDir, 'home');
+  const vaultDir = path.join(caseDir, 'vault');
+
+  // init --no-step-sync sets stepSyncEnabled = false
+  const initOffIo = makeMemoryIo({ platform: 'win32' });
+  const initOffCode = await runCli(
+    [
+      '--dsh-home', dshHome,
+      'init',
+      '--non-interactive',
+      '--vault', vaultDir,
+      '--no-passphrase',
+      '--no-step-sync',
+    ],
+    initOffIo,
+  );
+  assert.equal(initOffCode, 0, initOffIo.getStderr());
+  assert.equal((await loadConfig(dshHome)).stepSyncEnabled, false);
+
+  // init --step-sync on sets stepSyncEnabled = true
+  const initOnIo = makeMemoryIo({ platform: 'win32' });
+  const initOnCode = await runCli(
+    [
+      '--dsh-home', dshHome,
+      'init',
+      '--non-interactive',
+      '--vault', vaultDir,
+      '--no-passphrase',
+      '--step-sync', 'on',
+    ],
+    initOnIo,
+  );
+  assert.equal(initOnCode, 0, initOnIo.getStderr());
+  assert.equal((await loadConfig(dshHome)).stepSyncEnabled, true);
+
+  // config stepSync=off sets stepSyncEnabled = false
+  const cfgOffIo = makeMemoryIo({ platform: 'win32' });
+  const cfgOffCode = await runCli(['--dsh-home', dshHome, 'config', 'stepSync=off'], cfgOffIo);
+  assert.equal(cfgOffCode, 0, cfgOffIo.getStderr());
+  assert.equal((await loadConfig(dshHome)).stepSyncEnabled, false);
+
+  // Verify install-win.ps1 accepts -DisableStepSync and install-mac.sh accepts --disable-step-sync
+  const ps1Text = await fs.readFile(path.join(REPO_ROOT, 'scripts', 'install-win.ps1'), 'utf8');
+  assert.match(ps1Text, /\[switch\]\$DisableStepSync/);
+  assert.match(ps1Text, /--no-step-sync/);
+  const shText = await fs.readFile(path.join(REPO_ROOT, 'scripts', 'install-mac.sh'), 'utf8');
+  assert.match(shText, /--disable-step-sync/);
+  assert.match(shText, /--no-step-sync/);
+
+  // Verify INSTALL_PROMPT.md exists, is UTF-8 without BOM, and guides AI installation
+  const promptBuf = await fs.readFile(path.join(REPO_ROOT, 'INSTALL_PROMPT.md'));
+  assert.ok(!(promptBuf.length >= 3 && promptBuf[0] === 0xEF && promptBuf[1] === 0xBB && promptBuf[2] === 0xBF));
+  const promptText = promptBuf.toString('utf8');
+  assert.match(promptText, /install-win\.ps1/);
+  assert.match(promptText, /install-mac\.sh/);
+  assert.match(promptText, /DisableStepSync/);
+  assert.match(promptText, /--disable-step-sync/);
+  assert.match(promptText, /30\s*秒/);
+});
+
 const LOCAL_DSH_DIR = process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness')
   : '';
@@ -455,13 +517,15 @@ test(
       });
       assert.match(run1.stdout, /体检通过/);
 
-      // Run 2: idempotent reinstall must succeed with exit code 0
-      const run2 = await execFile('powershell.exe', installArgs, {
+      // Run 2: idempotent reinstall with -DisableStepSync must succeed with exit code 0 and set stepSyncEnabled = false
+      const run2 = await execFile('powershell.exe', [...installArgs, '-DisableStepSync'], {
         cwd: REPO_ROOT,
         windowsHide: true,
         timeout: 60000,
       });
       assert.match(run2.stdout, /体检通过/);
+      const liveCfgAfterDisable = await loadConfig(isolatedDshHome);
+      assert.equal(liveCfgAfterDisable.stepSyncEnabled, false, '-DisableStepSync should persist stepSyncEnabled=false');
 
       // Run real DSH host CLI `--profile web --dump-config` from isolated sandboxDir
       const dumpRes = await execFile(
@@ -645,13 +709,24 @@ fakeAgent.scope = createScope(ctx, fakeAgent);
 fakeAgent.ctx = fakeAgent.scope.ctx;
 
 await fs.writeFile(path.join(winWs, 'notes.md'), '# 实时验收假设\\n', 'utf8');
-for (const line of ['/soul status', '/soul keep notes.md', '/soul config maxFileMB=48', '/soul handoff 验收通过', '/soul push', '/soul pull']) {
+for (const line of [
+  '/soul status',
+  '/soul keep notes.md',
+  '/soul config maxFileMB=48',
+  '/soul handoff 验收通过',
+  '/soul push',
+  '/soul pull',
+  '/soul 帮我看看同步正常吗',
+  '/soul 关闭30秒快照',
+  '/soul 开启30秒快照',
+  '/soul 帮我对比一下冲突副本和现在的估值表差在哪并合并',
+]) {
   const execRes = await ctx.get('commands').execute(fakeAgent, line, [], new AbortController().signal);
   assert.ok(execRes, 'Command should resolve: ' + line);
   assert.equal(execRes.result.kind, 'success', line + ' failed: ' + execRes.result.text);
 }
-assert.equal(steered.length, 1);
-assert.equal(liveSession.snapshotEvents().length, 12);
+assert.equal(steered.length, 2);
+assert.equal(liveSession.snapshotEvents().length, 20);
 await ctx.fiber.dispose();
 console.log('ASAR_LIVE_SERVICES_OK');
 `;

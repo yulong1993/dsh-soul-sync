@@ -21,15 +21,27 @@
 
 ## 2. 两分钟首次配置
 
-### 第一步：选一个网盘金库目录
-
-在你的 OneDrive、iCloud Drive、百度网盘同步盘或 NAS 映射盘里，新建一个空文件夹专门当**防灾金库**，例如：
-- Windows：`D:\OneDrive\dsh-vault`
-- macOS：`/Users/你的用户名/Library/CloudStorage/OneDrive-Personal/dsh-vault`
+先在你的 OneDrive、iCloud Drive、百度网盘同步盘或 NAS 映射盘里，选好一个空文件夹专门当**防灾金库**（例如 Windows `D:\OneDrive\dsh-vault`、macOS `/Users/你的用户名/Library/CloudStorage/OneDrive-Personal/dsh-vault`）。
 
 > 小贴士：建议右键这个金库文件夹，勾选 **「始终保留在此设备上 / Always keep on this device」**，避免网盘自动清理缓存导致换机时还要等下载。
 
-### 第二步：在 Windows 上一键安装
+### 方法 A（最推荐 · 零命令行）：复制一段话发给 DSH，让 AI 自己帮你装
+
+**完全不需要打开终端或记任何命令！** 打开 DeepSeek Harness，把 **[INSTALL_PROMPT.md](./INSTALL_PROMPT.md)** 里的全自动安装提示词复制发给 AI（也可直接复制下面这段精简指令）：
+
+```text
+请读取当前（或我指定路径的）dsh-soul-sync 目录里的 INSTALL_PROMPT.md，
+按里面的 4 步向导，用大白话一次性向我确认金库路径、是否加密、工作区配对以及是否开启 30 秒防断电快照，
+然后自动识别我的操作系统替我跑完安装脚本并核对 doctor 体检通过。
+```
+
+回答 AI 问你的 3 个小问题后，等它报「体检通过」，**重启一次 DeepSeek Harness** 就能直接用！另一台电脑重复发同一段话、填同一个口令和同一组路径配对即可。
+
+---
+
+### 方法 B（备用）：手动一行命令安装
+
+#### Windows 一键安装
 
 先右键退出右下角托盘里的 **DeepSeek Harness**，然后在 PowerShell 里运行（把路径和口令换成你自己的）：
 
@@ -40,13 +52,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-win.ps1 `
   -Map "us-equity=D:\美股分析::/Users/你的Mac用户名/美股分析"
 ```
 
-- 如果不想每次敲参数，也可以直接运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install-win.ps1`，会进入中文问答向导一步步带你填。
-- 如果有多个常用项目，可以重复传多个 `-Map`（例如 `-Map "D:\美股分析::/Users/me/美股分析","D:\A股跟踪::/Users/me/A股跟踪"`）。
-- 如果只用内部信任网盘、不想设加密口令，把 `-Passphrase "..."` 换成 `-NoPassphrase` 即可。
+- 不想敲参数？直接运行 `powershell -ExecutionPolicy Bypass -File .\scripts\install-win.ps1` 进入中文问答向导。
+- 多个常用项目可传多个 `-Map`（例如 `-Map "D:\美股分析::/Users/me/美股分析","D:\A股跟踪::/Users/me/A股跟踪"`）。
+- 不想设加密口令，把 `-Passphrase "..."` 换成 `-NoPassphrase`。
+- 稳妥派不想开启运行中每 30 秒步级快照，可追加 `-DisableStepSync`（仅在每轮对话结束时安全同步）。
 
-### 第三步：在 macOS 上一键安装
+#### macOS 一键安装
 
-先把 `dsh-soul-sync` 文件夹拷贝到 Mac，彻底退出 DeepSeek Harness（`Cmd+Q`），打开「终端」运行：
+把 `dsh-soul-sync` 文件夹拷贝到 Mac，彻底退出 DeepSeek Harness（`Cmd+Q`），打开「终端」运行：
 
 ```bash
 bash ./scripts/install-mac.sh \
@@ -55,40 +68,44 @@ bash ./scripts/install-mac.sh \
   --map "us-equity=D:\美股分析::/Users/你的Mac用户名/美股分析"
 ```
 
+- 稳妥派如需关闭运行中每 30 秒步级快照，追加 `--disable-step-sync` 即可。
+
 > **双端必须保持一致的两件事**：① 同一个加密口令（或都不设口令）；② 相同的 `--map` 映射规则（`Windows路径::Mac路径`）。
 
-安装脚本会自动帮你完成：
-- 生成 `~/.dsh/soul-sync/config.json` 与本机密钥；
-- 写入全局跨平台规则 `~/.dsh/AGENTS.md`（让 AI 写 Python 脚本自动兼容 Windows/Mac 路径与中文字体）；
-- 安装接力技能 `~/.dsh/skills/soul-handoff/SKILL.md`；
-- 自动把插件注册到 `web` 和 `desktop` 两个配置里，并跑一遍 `doctor` 体检。
-
-重新打开 DeepSeek Harness，在任意对话框输入 `/soul status`，看到 **《双机接力体检卡》** 就成功了！
+安装脚本会自动帮你完成配置生成、写入跨平台 `AGENTS.md` 规则、安装 `soul-handoff` 技能、注册 `web`/`desktop` 两个 profile 并跑一遍 `doctor` 体检。重新打开 DeepSeek Harness，输入 `/soul 帮我看看现在同步正常吗`（或 `/soul status`）看到 **《双机接力体检卡》** 就大功告成！
 
 ---
 
-## 3. 日常怎么用
+## 3. 日常怎么用（直接说中文大白话就行）
 
 ### 零感知自动防灾（平时什么都不用做）
 
-- **每 30 秒自动防灾快照**：就算 AI 正在跑一个长达 10 分钟的多步分析，每完成一步（按 30 秒节流）都会把最新对话进度默默存进金库，突然断电最多只丢最后不到半分钟。
-- **每轮对话结束自动双平面同步**：聊完一轮，对话记录、附图附件、以及这轮 AI 写出的 Python 脚本 / Excel 表格 / Markdown 报告会自动同步到金库。
+- **每 30 秒步级防断电快照（可独立开关）**：默认开启——就算 AI 正在跑长达 10 分钟的多步分析，运行中每 30 秒也会把最新对话进度默默存进金库，突然断电最多只丢最后不到半分钟。如果你是稳妥派、希望运行中零干扰，随时发一句 `/soul 关闭30秒快照` 即可关掉（需要时再发 `/soul 开启30秒快照` 打开）。
+- **每轮对话结束自动双平面同步（始终常开）**：无论 30 秒快照开不开，每聊完一轮，对话记录、附图附件、以及这轮 AI 写出的 Python 脚本 / Excel 表格 / Markdown 报告都会 100% 自动同步到金库。
 - **打开电脑自动拉取**：另一台电脑启动 DeepSeek Harness 时，会自动静默把远端最新对话和表格拉到位，并自动把目录从 `D:\美股分析` 翻译成 `/Users/你/美股分析`。
 
-### 下班换电脑前的 10 秒仪式：`/soul handoff`
+### `/soul + 自然语言大白话`（不用背英文子命令！）
 
-准备合盖换另一台电脑继续干活前，在当前对话里发一句：
+你可以直接用 `/soul` 加一句大白话指挥它——高频操作零延迟秒回，复杂多步需求会自动交给当前对话的 AI 助手结合实时同步状态替你动手搞定：
 
-```text
-/soul handoff 晚上回家用 Mac 继续做毛利率敏感性测算
-```
-
-它会立刻做三件事：
-1. **检查有没有忘记关 Excel**：如果检测到 `~$估值表.xlsx` 占锁，立刻提醒你先 `Ctrl+S` 保存并关掉 Excel；
-2. **让 AI 写一段 150~250 字的第一人称《中场交接心路日记》**：把我们正在推进的核心命题、刚才试过走不通的死胡同（伤疤清单）、以及下一步动作直接留在对话里；
-3. **Flash 看图 → V4Pro 深度推演无缝桥接**：如果你在公司用支持看图的 `deepseek-flash` 看过财报截图/K 线图，回家切到纯文本的 `deepseek-v4-pro` 深度推理，交接日记和自动压缩都会把图里的核心数字、拐点和结论转写成清晰文字，绝不会换了模型就“失明”。
-
-等你回家打开 Mac 点开同一个会话接着聊，插件会自动给 AI 递上一句第一人称接力备注，AI 开口就是顺着刚才的上下文自然往下推进，完全没有“换了个陌生助手”的割裂感。
+- **查体检状态 / 查 Excel 锁**：`/soul 帮我看看现在同步正常吗`、`/soul 有没有没关的Excel锁`
+- **下班换电脑交接（10 秒仪式）**：
+  ```text
+  /soul 我准备下班回家用Mac继续算毛利率了
+  ```
+  它会自动做三件事：
+  1. **检查有没有忘记关 Excel**：如果检测到 `~$估值表.xlsx` 占锁，立刻提醒你先 `Ctrl+S` 保存并关掉 Excel；
+  2. **让 AI 写一段 150~250 字的第一人称《中场交接心路日记》**：把核心命题、已排除的死胡同（伤疤清单）和下一步动作留在对话里；
+  3. **Flash 看图 → V4Pro 深度推演无缝桥接**：自动把前文财报截图/K 线图里的核心数字、拐点和结论转写成清晰文字，换到纯文本 `deepseek-v4-pro` 也绝不“失明”。
+- **把手工文件加进同步**：`/soul 把 outputs/估值表.xlsx 加进同步`、`/soul 帮我把 notes/核心假设.md 也加进同步`
+- **开关 30 秒防断电快照**：`/soul 关闭30秒快照`、`/soul 开启30秒快照`
+- **拉取更新 / 排空 Excel 暂存**：`/soul 把家里Mac改过的东西拉下来`、`/soul 我把Excel关了帮我把暂存文件落位`
+- **立即备份**：`/soul 帮我把现在的进度马上备份一下`
+- **动态改容量 / 绑新目录**：`/soul 把单文件上限改成 100M`、`/soul 工作区总上限改成 1G`、`/soul 绑定目录 D:\港股研究 到 /Users/我/港股研究`
+- **复杂协同任务（自动唤醒当前 AI 动手处理）**：
+  - `/soul 帮我对比一下冲突副本和现在的估值表差在哪并合并`
+  - `/soul 帮我看看今天新建的几个脚本哪些还没进同步账本，挑重要的同步上去`
+  - `/soul 帮我排查一下为什么刚才有个文件被拦截了`
 
 ---
 
@@ -107,13 +124,9 @@ bash ./scripts/install-mac.sh \
 
 ### 几个超实用的日常技巧
 
-- **手工建的文件也想同步**：比如你自己新建了一个 `notes/核心假设.md` 或手工做了一张 `草稿估值.xlsx`，直接发：
-  ```text
-  /soul keep notes/核心假设.md
-  ```
-  就会立刻记入账本并同步到另一台电脑。
-- **Excel 没关导致占锁怎么办**：不用慌！远端推来的新版表格会自动暂存在工作区里的 `.dsh-incoming/` 目录。你关掉 Excel 后，发一句 `/soul pull`（或在终端运行 `dsh-soul pull`），它就会自动落位并清空 `.dsh-incoming/`。
-- **两台电脑离线同时改了同一张表怎么办**：绝不互相覆盖！本机版本原样保留，另一台电脑的版本会并列保存成 `估值表 (来自家里Mac 2026-11-24).xlsx`，让你对照合并。
+- **手工建的文件也想同步**：直接发 `/soul 把 notes/核心假设.md 加进同步`（或 `/soul keep notes/核心假设.md`），就会立刻记入账本并同步到另一台电脑。
+- **Excel 没关导致占锁怎么办**：不用慌！远端推来的新版表格会自动暂存在工作区里的 `.dsh-incoming/` 目录。你关掉 Excel 后，发一句 `/soul 我把Excel关了帮我把暂存文件落位`（或 `/soul pull`），它就会自动落位并清空 `.dsh-incoming/`。
+- **两台电脑离线同时改了同一张表怎么办**：绝不互相覆盖！本机版本原样保留，另一台电脑的版本会并列保存成 `估值表 (来自家里Mac 2026-11-24).xlsx`，发一句 `/soul 帮我对比一下冲突副本和现在的表差在哪并合并` 就能让 AI 协助对照合并。
 - **误删文件能找回吗**：对端删除文件时，本机不会直接永久粉碎，而是先移到 `~/.dsh/trash/<工作区>/` 保留 **14 天**，随时可捡回来。
 
 ---
@@ -123,14 +136,7 @@ bash ./scripts/install-mac.sh \
 如果公司电脑彻底报废，换一台全新电脑（无论 Windows 还是 Mac），只需要 **3 步** 满血复活：
 
 1. **安装网盘客户端并等防灾金库同步完成**（确保金库目录里的 `blobs/` 和 `devices/` 已下载到本地）。
-2. **安装 DeepSeek Harness 并跑一遍一键安装脚本**，填入同样的金库路径、同样的加密口令和新电脑的工作区路径映射：
-   ```powershell
-   # Windows 新电脑示例
-   powershell -ExecutionPolicy Bypass -File .\scripts\install-win.ps1 `
-     -VaultDir "D:\OneDrive\dsh-vault" `
-     -Passphrase "你之前设的口令" `
-     -Map "us-equity=D:\美股分析::/Users/你/美股分析"
-   ```
+2. **安装 DeepSeek Harness 并完成插件配置**（用 [INSTALL_PROMPT.md](./INSTALL_PROMPT.md) 发给 AI 自动装，或手动跑一遍一键安装脚本，填入同样的金库路径、同样的加密口令和新电脑的工作区路径映射）。
 3. **执行离线全量恢复**（如果还没开 DSH，直接终端运行一行即可）：
    ```powershell
    node .\bin\dsh-soul.js pull
@@ -141,29 +147,31 @@ bash ./scripts/install-mac.sh \
 
 ## 6. 配额调整与命令速查表
 
-默认安全配额：单文件上限 **30 MB**、单工作区上限 **500 MB**、历史版本保留 **10 份**、步级防灾节流 **30 秒**、软删除回收站保留 **14 天**。你可以随时动态修改，不用重启。
+默认安全配额：单文件上限 **30 MB**、单工作区上限 **500 MB**、历史版本保留 **10 份**、步级防灾快照 **默认开启（30 秒节流，可独立关闭）**、软删除回收站保留 **14 天**。你可以随时用自然语言或参数命令动态修改，不用重启。
 
-### A. DeepSeek Harness 对话框内斜杠命令
+### A. DeepSeek Harness 对话框内 `/soul` 指令（支持大白话 + 精确子命令）
 
-| 命令 | 作用 |
-| --- | --- |
-| `/soul status` | 查看《双机接力体检卡》（金库、加密状态、双端心跳、Flash/V4Pro 档位提示、Excel 占锁与 `.dsh-incoming/` 状态） |
-| `/soul handoff [备注]` | 下班换机仪式：检查 Excel 锁、生成第一人称交接日记、备份并释放接力棒 |
-| `/soul pull` | 立即从金库拉取最新会话与产出物，并自动排空 `.dsh-incoming/` 暂存文件 |
-| `/soul push` | 立即把当前会话与工作区受管产出物推送到金库 |
-| `/soul keep <相对路径>` | 手动把某个本地文件纳入同步账本并立即推送 |
-| `/soul config` | 查看当前配额与配置 |
-| `/soul config maxFileMB=64 retainSnapshots=15` | 实时调整单文件上限、工作区上限、历史保留份数等配额 |
+| 常见大白话示例 | 等价精确子命令 | 作用 |
+| --- | --- | --- |
+| `/soul 帮我看看现在同步正常吗` | `/soul status` | 查看《双机接力体检卡》（金库、加密、30秒快照开关、双端心跳、Flash/V4Pro 档位、Excel 锁） |
+| `/soul 我要回家换Mac继续算毛利率了` | `/soul handoff [备注]` | 下班换机仪式：检查 Excel 锁、生成第一人称交接日记、备份并释放接力棒 |
+| `/soul 把家里Mac改过的东西拉下来` | `/soul pull` | 立即拉取最新会话与产出物，并自动排空 `.dsh-incoming/` 暂存文件 |
+| `/soul 帮我把现在的进度马上备份一下` | `/soul push` | 立即把当前会话与工作区受管产出物推送到金库 |
+| `/soul 把 outputs/估值表.xlsx 加进同步` | `/soul keep <路径>` | 手动把某个本地文件纳入同步账本并立即推送 |
+| `/soul 关闭30秒快照` / `/soul 开启30秒快照` | `/soul config stepSync=off\|on` | 独立关闭或开启运行中每 30 秒步级防断电快照（不影响每轮结束自动同步） |
+| `/soul 把单文件上限改成 100M` | `/soul config maxFileMB=100` | 实时调整单文件上限、工作区上限、历史保留份数、快照间隔等配额 |
+| `/soul 绑定目录 D:\港股研究 到 /Users/me/港股研究` | `dsh-soul init --map ...` | 动态添加跨系统工作区目录映射并立即生效 |
+| `/soul 帮我对比合并冲突副本` | *(自动委派当前 AI 助手)* | 复杂/开放式诉求自动交由当前 DSH AI 结合实时体检卡与本地文件协同完成 |
 
 ### B. 独立命令行工具（`node ./bin/dsh-soul.js` 或 `dsh-soul`）
 
 | 命令 | 作用 |
 | --- | --- |
-| `dsh-soul init [选项]` | 交互式或参数化初始化配置、金库、加密口令、工作区映射与技能 |
+| `dsh-soul init [选项]` | 交互式或参数化初始化配置、金库、加密口令、工作区映射、30秒快照开关（`--no-step-sync` / `--step-sync on\|off`）与技能 |
 | `dsh-soul status` | 查看完整双机同步与本地会话/工作区统计报告 |
 | `dsh-soul push [--workspace <目录>]` | 离线全量备份本机全部会话、`AGENTS.md` 与所有映射工作区产出物 |
 | `dsh-soul pull [--force]` | 离线全量恢复/合并（若检测到桌面端正在运行会温和保护，可传 `--force` 强制） |
 | `dsh-soul keep <路径> [--workspace <目录>]` | 手动纳管指定文件并立即推送 |
-| `dsh-soul config [key=value ...]` | 查看或修改 `maxFileMB`、`maxWorkspaceMB`、`retainSnapshots`、`stepSyncIntervalMs`、`trashRetentionDays`、`deviceLabel`、`vaultDir` |
+| `dsh-soul config [key=value ...]` | 查看或修改 `stepSync`、`stepSyncEnabled`、`maxFileMB`、`maxWorkspaceMB`、`retainSnapshots`、`stepSyncIntervalMs`、`trashRetentionDays`、`deviceLabel`、`vaultDir` |
 | `dsh-soul doctor` | 全面自检配置、金库可读写性、加密密钥、技能、规则块与 DSH 插件注册状态 |
 | `dsh-soul watch [--interval-ms 60000]` | 启动轻量级后台守护进程，定时备份会话与监听工作区产出物变更 |

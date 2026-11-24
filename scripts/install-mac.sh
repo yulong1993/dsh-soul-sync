@@ -7,6 +7,7 @@ PASSPHRASE_ARG=""
 HAS_PASSPHRASE=0
 NO_PASSPHRASE=0
 DEVICE_LABEL_ARG=""
+DISABLE_STEP_SYNC=0
 SKIP_DESKTOP=0
 SKIP_WEB=0
 NON_INTERACTIVE=0
@@ -37,6 +38,8 @@ while [ $# -gt 0 ]; do
       MAP_ARGS+=("$2"); MAP_COUNT=$((MAP_COUNT + 1)); shift 2 ;;
     --map=*)
       MAP_ARGS+=("${1#*=}"); MAP_COUNT=$((MAP_COUNT + 1)); shift ;;
+    --disable-step-sync)
+      DISABLE_STEP_SYNC=1; shift ;;
     --skip-desktop)
       SKIP_DESKTOP=1; shift ;;
     --skip-web)
@@ -44,7 +47,7 @@ while [ $# -gt 0 ]; do
     --non-interactive)
       NON_INTERACTIVE=1; shift ;;
     -h|--help)
-      echo "用法: bash scripts/install-mac.sh [--dsh-home <dir>] [--vault <dir>] [--passphrase <str> | --no-passphrase] [--map <id=win::mac>] [--skip-desktop] [--skip-web] [--non-interactive]"
+      echo "用法: bash scripts/install-mac.sh [--dsh-home <dir>] [--vault <dir>] [--passphrase <str> | --no-passphrase] [--map <id=win::mac>] [--disable-step-sync] [--skip-desktop] [--skip-web] [--non-interactive]"
       exit 0 ;;
     *)
       echo "未知参数: $1" >&2
@@ -137,6 +140,9 @@ if [ "$MAP_COUNT" -gt 0 ]; then
   for m in ${MAP_ARGS[@]+"${MAP_ARGS[@]}"}; do
     INIT_ARGS+=("--map" "$m")
   done
+fi
+if [ "$DISABLE_STEP_SYNC" -eq 1 ]; then
+  INIT_ARGS+=("--no-step-sync")
 fi
 
 echo ""

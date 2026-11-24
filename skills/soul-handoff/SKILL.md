@@ -76,5 +76,17 @@ return await agent({
 ## 三、换机前安全检查清单
 
 - 若正在用 Excel 编辑工作区内的 `.xlsx` 估值表，先按 **Ctrl+S 保存并关闭 Excel**（若存在 `~$*.xlsx` 锁文件，`/soul status` 与 `/soul handoff` 会自动预警）。
-- 若需临时保留根目录或非 `outputs/` 下的重要手工文件，执行 `/soul keep <相对路径>` 立即纳入加密防灾同步。
-- 换到新设备打开 DSH 后，无冲突的会话与产出物会自动静默同步到位；若曾因 Excel 占锁暂存至 `.dsh-incoming/`，关闭 Excel 后运行 `/soul pull` 即可自动落位。
+- 若需临时保留根目录或非 `outputs/` 下的重要手工文件，执行 `/soul keep <相对路径>` 或直接说 `/soul 把 <文件路径> 加进同步`，立即纳入加密防灾同步。
+- 换到新设备打开 DSH 后，无冲突的会话与产出物会自动静默同步到位；若曾因 Excel 占锁暂存至 `.dsh-incoming/`，关闭 Excel 后运行 `/soul pull`（或 `/soul 把暂存文件落位`）即可自动落位。
+
+---
+
+## 四、自然语言同步管理与 `dsh-soul` 协同操作指南
+
+用户在日常对话或通过 `/soul <大白话>` 提出同步管理诉求（例如“把刚才那个估值表也同步上”、“帮我对比一下冲突副本和现在的表差在哪并合并”、“看看今天新建的脚本哪些还没进同步账本”、“排查为什么有文件被拦截”）时，系统会自动把 `[Soul Sync 自然语言协同请求]` 连同实时体检卡与 `bin/dsh-soul.js` 精确路径交给你：
+
+1. **查看同步状态与账本**：运行 `node "<repoRoot>/bin/dsh-soul.js" --dsh-home "<dshHome>" status` 或 `doctor` 检查金库、加密、双端心跳、步级快照开关与占锁状态；需要查看某工作区受管文件列表时，读取 `<dshHome>/soul-sync/state/workspace-<id>.json`。
+2. **帮用户把指定文件纳管并推送**：定位用户口头提到的文件（如刚修改的估值表、脚本或笔记），执行 `node "<repoRoot>/bin/dsh-soul.js" --dsh-home "<dshHome>" keep "<文件路径>"`。
+3. **调整配额或开关 30 秒防断电快照**：执行 `node "<repoRoot>/bin/dsh-soul.js" --dsh-home "<dshHome>" config stepSync=off`（或 `stepSync=on`、`maxFileMB=100`、`maxWorkspaceMB=1024`、`retainSnapshots=20`）。
+4. **对比并合并双边冲突副本**：定位工作区中带 ` (来自...)` 后缀的冲突副本与本地原文件，逐项对比差异（文本/Markdown/Python 直接 diff，Excel 用 Python `openpyxl` 读取核对单元格差异），严禁擅自覆盖人工排版模板；向用户简明汇报差异并完成安全合并后，执行 `push` 将最新结果同步到金库。
+5. **排查同步拦截原因**：检查文件是否超过单文件/工作区上限、是否命中敏感凭证守卫（`.env` / `sk-` 密钥）、是否因 Excel 占锁暂存在 `.dsh-incoming/` 或处于未写完状态，并直接给出通俗中文解释与一步解决方案。

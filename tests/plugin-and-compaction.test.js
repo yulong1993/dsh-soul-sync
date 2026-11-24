@@ -32,6 +32,7 @@ import {
   apply as applySoulSyncPlugin,
   SoulSyncController,
 } from '../lib/index.js';
+import { parseNaturalSoulIntent } from '../lib/nl-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -731,4 +732,277 @@ test('/soul config vaultDir hot-rebuilds controller.vault and tools/result extra
   assert.ok(wsState.trackedPaths['outputs/from-meta.txt'], 'payload.meta.path should be tracked');
   assert.ok(wsState.trackedPaths['outputs/from-result-meta.txt'], 'payload.result.meta.path should be tracked');
   await controller.dispose();
+});
+
+test('stepSyncEnabled toggle: default true, disables step/end while keeping turn/end intact, status card & config & NL toggle', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'step-sync-toggle');
+  const dshHome = path.join(caseDir, 'dsh-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const wsDir = path.join(caseDir, 'ws-toggle');
+  await fs.mkdir(path.join(wsDir, 'outputs'), { recursive: true });
+
+  // Default config has stepSyncEnabled === true
+  const defaultCfg = await loadConfig(dshHome);
+  assert.equal(defaultCfg.stepSyncEnabled, true);
+
+  await saveConfig(dshHome, {
+    deviceId: 'win-toggle-01',
+    deviceLabel: '稳妥派Win',
+    platform: 'win32',
+    vaultDir,
+    encryptionEnabled: false,
+    stepSyncEnabled: false,
+    workspaceMappings: [
+      { id: 'ws-toggle', title: '稳妥项目', win32: wsDir, darwin: '/Users/me/ws-toggle' },
+    ],
+  });
+  const loadedDisabled = await loadConfig(dshHome);
+  assert.equal(loadedDisabled.stepSyncEnabled, false);
+
+  const sessionId = 'sess-step-toggle-01';
+  const header = { version: 4, id: sessionId, cwd: wsDir, createdAt: Date.now() };
+  const events = [
+    { seq: 0, time: Date.now(), type: 'user/message', data: { content: [{ type: 'text', text: '测试关闭30秒快照' }] } },
+  ];
+  await writeLocalSession(dshHome, header, events);
+
+  const ctx = createMockCordisCtx();
+  const controller = await applySoulSyncPlugin(ctx, {
+    dshHome,
+    platform: 'win32',
+    minQuietMs: 0,
+  });
+  await controller.readyPromise;
+
+  const soulCmd = ctx.commands.get('soul');
+  const vault = new VaultStore({ vaultDir, deviceId: 'observer', platform: 'darwin' });
+  const sessionObj = { id: sessionId, cwd: wsDir, header, snapshotEvents: () => [...events] };
+
+  // Status card clearly shows disabled state
+  const statusOff = await soulCmd.handler({ rawInput: 'status' });
+  assert.equal(statusOff.kind, 'success');
+  assert.ok(statusOff.text.includes('步级防断电快照（运行中每30秒）'));
+  assert.ok(statusOff.text.includes('已关闭'));
+  assert.ok(statusOff.text.includes('/soul 开启30秒快照'));
+
+  // Config overview shows stepSyncEnabled: false
+  const cfgOverview = await soulCmd.handler({ rawInput: 'config' });
+  assert.equal(cfgOverview.kind, 'success');
+  assert.ok(cfgOverview.text.includes('`stepSyncEnabled`: false'));
+
+  // When stepSyncEnabled === false, step/end MUST NOT flush or export session
+  await ctx.emit('session/event', sessionObj, { type: 'step/end', data: {} });
+  assert.equal(ctx._flushCalls.length, 0);
+  let sessCommits = await vault.listCommits('session', { targetId: sessionId, includeSelf: true });
+  assert.equal(sessCommits.commits.length, 0);
+
+  // turn/end MUST STILL export session AND workspace deliverables 100% normally
+  await fs.writeFile(path.join(wsDir, 'outputs', 'report.md'), '# 完稿\n', 'utf8');
+  await ctx.emit('session/event', sessionObj, { type: 'turn/end', data: {} });
+  assert.equal(ctx._flushCalls.length, 1);
+  sessCommits = await vault.listCommits('session', { targetId: sessionId, includeSelf: true });
+  let wsCommits = await vault.listCommits('workspace', { targetId: 'ws-toggle', includeSelf: true });
+  assert.equal(sessCommits.commits.length, 1);
+  assert.equal(wsCommits.commits.length, 1);
+
+  // Toggle ON via natural language: /soul 开启30秒防灾快照
+  const nlOnRes = await soulCmd.handler({ rawInput: '开启30秒防灾快照' });
+  assert.equal(nlOnRes.kind, 'success');
+  assert.equal((await loadConfig(dshHome)).stepSyncEnabled, true);
+  assert.equal(controller.config.stepSyncEnabled, true);
+
+  const statusOn = await soulCmd.handler({ rawInput: 'status' });
+  assert.ok(statusOn.text.includes('已开启'));
+  assert.ok(statusOn.text.includes('/soul 关闭30秒快照'));
+
+  // Now step/end triggers export!
+  await ctx.emit('session/event', sessionObj, { type: 'step/end', data: {} });
+  assert.equal(ctx._flushCalls.length, 2);
+  sessCommits = await vault.listCommits('session', { targetId: sessionId, includeSelf: true });
+  assert.equal(sessCommits.commits.length, 2);
+
+  // Toggle OFF via /soul config stepSync=off and back ON via stepSyncEnabled=1
+  const cfgOff = await soulCmd.handler({ rawInput: 'config stepSync=off' });
+  assert.equal(cfgOff.kind, 'success');
+  assert.equal((await loadConfig(dshHome)).stepSyncEnabled, false);
+
+  const cfgOn = await soulCmd.handler({ rawInput: 'config stepSyncEnabled=1' });
+  assert.equal(cfgOn.kind, 'success');
+  assert.equal((await loadConfig(dshHome)).stepSyncEnabled, true);
+
+  // Toggle OFF via natural language: /soul 关闭30秒自动快照
+  const nlOffRes = await soulCmd.handler({ rawInput: '关闭30秒自动快照' });
+  assert.equal(nlOffRes.kind, 'success');
+  assert.equal((await loadConfig(dshHome)).stepSyncEnabled, false);
+
+  await ctx.disposeAll();
+});
+
+test('nl-router & /soul natural-language routing: all Tier-1 direct intents and Tier-2 agent-assist delegation', async () => {
+  // Unit checks on parseNaturalSoulIntent
+  assert.deepEqual(parseNaturalSoulIntent('关闭30秒自动快照'), { kind: 'set-step-sync', enabled: false });
+  assert.deepEqual(parseNaturalSoulIntent('把每30秒备份关掉免得出问题'), { kind: 'set-step-sync', enabled: false });
+  assert.deepEqual(parseNaturalSoulIntent('停用步级同步'), { kind: 'set-step-sync', enabled: false });
+  assert.deepEqual(parseNaturalSoulIntent('开启30秒快照'), { kind: 'set-step-sync', enabled: true });
+  assert.deepEqual(parseNaturalSoulIntent('打开步级备份'), { kind: 'set-step-sync', enabled: true });
+
+  assert.deepEqual(parseNaturalSoulIntent('把单文件上限改成 100M'), { kind: 'config', argsText: 'maxFileMB=100' });
+  assert.deepEqual(parseNaturalSoulIntent('单文件上限 1G'), { kind: 'config', argsText: 'maxFileMB=1024' });
+  assert.deepEqual(parseNaturalSoulIntent('工作区总上限改成 1G'), { kind: 'config', argsText: 'maxWorkspaceMB=1024' });
+  assert.deepEqual(parseNaturalSoulIntent('历史版本保留 20 份'), { kind: 'config', argsText: 'retainSnapshots=20' });
+  assert.deepEqual(parseNaturalSoulIntent('快照间隔改成 60 秒'), { kind: 'config', argsText: 'stepSyncSeconds=60' });
+
+  const mapIntent = parseNaturalSoulIntent('帮我绑定目录 D:\\港股研究 到 /Users/alice/港股研究');
+  assert.equal(mapIntent.kind, 'add-mapping');
+  assert.equal(mapIntent.winPath, 'D:\\港股研究');
+  assert.equal(mapIntent.macPath, '/Users/alice/港股研究');
+
+  assert.equal(parseNaturalSoulIntent('帮我看看现在同步正常吗').kind, 'status');
+  assert.equal(parseNaturalSoulIntent('有没有没关的Excel锁').kind, 'status');
+
+  const handoffIntent = parseNaturalSoulIntent('我准备下班回家用Mac继续算毛利率了');
+  assert.equal(handoffIntent.kind, 'handoff');
+  assert.equal(handoffIntent.extraNote, '我准备下班回家用Mac继续算毛利率了');
+
+  assert.deepEqual(parseNaturalSoulIntent('帮我把 notes/核心假设.md 也加进同步'), {
+    kind: 'keep',
+    targetPath: 'notes/核心假设.md',
+  });
+  assert.deepEqual(parseNaturalSoulIntent('把 outputs/估值模型.xlsx 同步上'), {
+    kind: 'keep',
+    targetPath: 'outputs/估值模型.xlsx',
+  });
+
+  // Must NOT misclassify generic sync progress without file path as `keep`
+  const progressSync = parseNaturalSoulIntent('帮我把最新进度同步一下');
+  assert.notEqual(progressSync.kind, 'keep');
+
+  assert.equal(parseNaturalSoulIntent('把家里Mac改过的东西拉下来').kind, 'pull');
+  assert.equal(parseNaturalSoulIntent('我把Excel关了帮我把暂存文件落位').kind, 'pull');
+  assert.equal(parseNaturalSoulIntent('帮我把现在的进度马上备份一下').kind, 'push');
+  assert.equal(parseNaturalSoulIntent('怎么用').kind, 'help');
+  assert.equal(parseNaturalSoulIntent('help').kind, 'help');
+
+  // Tier-2 complex / open-ended requests -> agent-assist (NEVER unknown subcommand error)
+  assert.equal(parseNaturalSoulIntent('帮我对比一下冲突副本和现在的估值表差在哪并合并').kind, 'agent-assist');
+  assert.equal(parseNaturalSoulIntent('帮我看看今天新建的几个脚本哪些还没进同步账本，挑重要的同步上去').kind, 'agent-assist');
+  assert.equal(parseNaturalSoulIntent('帮我排查一下为什么刚才有个文件被拦截了').kind, 'agent-assist');
+
+  // End-to-end execution through SoulSyncController /soul command
+  const caseDir = path.join(TEST_TMP_ROOT, 'nl-e2e');
+  const dshHome = path.join(caseDir, 'dsh-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const winWs = path.join(caseDir, 'win-ws');
+  const macWs = '/Users/alice/us-equity';
+  await fs.mkdir(path.join(winWs, 'notes'), { recursive: true });
+  await fs.mkdir(path.join(winWs, 'outputs'), { recursive: true });
+
+  await saveConfig(dshHome, {
+    deviceId: 'win-nl-01',
+    deviceLabel: '公司Win',
+    platform: 'win32',
+    vaultDir,
+    encryptionEnabled: false,
+    workspaceMappings: [
+      { id: 'ws-nl', title: '美股分析', win32: winWs, darwin: macWs },
+    ],
+  });
+
+  const ctx = createMockCordisCtx();
+  const controller = await applySoulSyncPlugin(ctx, { dshHome, platform: 'win32', minQuietMs: 0 });
+  await controller.readyPromise;
+  const soulCmd = ctx.commands.get('soul');
+
+  const steered = [];
+  const sessionId = 'sess-nl-01';
+  const header = { version: 4, id: sessionId, cwd: winWs, createdAt: Date.now() };
+  const events = [
+    { seq: 0, time: Date.now(), type: 'user/message', data: { content: [{ type: 'text', text: '测试自然语言' }] } },
+  ];
+  await writeLocalSession(dshHome, header, events);
+
+  const mockAgent = {
+    session: { id: sessionId, cwd: winWs, header, snapshotEvents: () => events },
+    async steer(msg) {
+      steered.push(msg);
+    },
+  };
+
+  // 1) NL status
+  const nlStatus = await soulCmd.handler({ agent: mockAgent, rawInput: '帮我看看现在同步正常吗' });
+  assert.equal(nlStatus.kind, 'success');
+  assert.ok(nlStatus.text.includes('双机接力体检卡'));
+
+  // 2) NL config quota (100M / 1G)
+  const nlQuota1 = await soulCmd.handler({ agent: mockAgent, rawInput: '把单文件上限改成 100M' });
+  assert.equal(nlQuota1.kind, 'success');
+  const nlQuota2 = await soulCmd.handler({ agent: mockAgent, rawInput: '工作区总上限改成 1G' });
+  assert.equal(nlQuota2.kind, 'success');
+  let cfg = await loadConfig(dshHome);
+  assert.equal(cfg.quotas.maxFileBytes, 100 * 1024 * 1024);
+  assert.equal(cfg.quotas.maxWorkspaceBytes, 1024 * 1024 * 1024);
+
+  // 3) NL add-mapping
+  const nlMap = await soulCmd.handler({
+    agent: mockAgent,
+    rawInput: '帮我绑定跨系统目录 D:\\港股研究 到 /Users/alice/港股研究',
+  });
+  assert.equal(nlMap.kind, 'success');
+  cfg = await loadConfig(dshHome);
+  assert.ok(
+    cfg.workspaceMappings.some((m) => m.win32 === 'D:\\港股研究' && m.darwin === '/Users/alice/港股研究'),
+    'workspaceMappings should include newly bound mapping',
+  );
+
+  // 4) NL keep with file path
+  await fs.writeFile(path.join(winWs, 'notes', '核心假设.md'), '# 假设\n毛利率 72%\n', 'utf8');
+  const nlKeep = await soulCmd.handler({ agent: mockAgent, rawInput: '帮我把 notes/核心假设.md 也加进同步' });
+  assert.equal(nlKeep.kind, 'success');
+  const wsState = await loadWorkspaceDeliverableState(dshHome, 'ws-nl');
+  assert.equal(wsState.trackedPaths['notes/核心假设.md']?.source, 'manual');
+
+  // 5) NL push & pull
+  const nlPush = await soulCmd.handler({ agent: mockAgent, rawInput: '帮我把现在的进度马上备份一下' });
+  assert.equal(nlPush.kind, 'success');
+  assert.ok(nlPush.text.includes('推送完成'));
+
+  const nlPull = await soulCmd.handler({ agent: mockAgent, rawInput: '把家里Mac改过的东西拉下来' });
+  assert.equal(nlPull.kind, 'success');
+  assert.ok(nlPull.text.includes('拉取完成'));
+
+  // 6) NL handoff -> triggers agent.steer with handoff diary prompt
+  const nlHandoff = await soulCmd.handler({ agent: mockAgent, rawInput: '我准备下班回家用Mac继续算毛利率了' });
+  assert.equal(nlHandoff.kind, 'success');
+  assert.equal(steered.length, 1);
+  assert.ok(steered[0].content[0].text.includes('中场交接心路日记'));
+  assert.ok(steered[0].content[0].text.includes('我准备下班回家用Mac继续算毛利率了'));
+
+  // 7) NL help
+  const nlHelp = await soulCmd.handler({ agent: mockAgent, rawInput: '你能帮我干嘛' });
+  assert.equal(nlHelp.kind, 'success');
+  assert.ok(nlHelp.text.includes('/soul'));
+
+  // 8) Tier-2 complex open-ended request -> delegates via agent.steer with structured Soul Sync context (NEVER returns error!)
+  const nlComplex = await soulCmd.handler({
+    agent: mockAgent,
+    rawInput: '帮我对比一下冲突副本和现在的估值表差在哪并合并',
+  });
+  assert.equal(nlComplex.kind, 'success');
+  assert.ok(nlComplex.text.includes('已收到你的自然语言指令'));
+  assert.equal(steered.length, 2);
+  const assistText = steered[1].content[0].text;
+  assert.ok(assistText.includes('[Soul Sync 自然语言协同请求]'));
+  assert.ok(assistText.includes('帮我对比一下冲突副本和现在的估值表差在哪并合并'));
+  assert.ok(assistText.includes('双机接力体检卡'));
+  assert.ok(assistText.includes('dsh-soul.js'));
+
+  // 9) Tier-2 fallback when no steer/followup/inbox route exists -> still returns kind: 'success' with status card
+  const nlComplexOffline = await soulCmd.handler({
+    agent: null,
+    rawInput: '帮我排查一下为什么刚才有个文件被拦截了',
+  });
+  assert.equal(nlComplexOffline.kind, 'success');
+  assert.ok(nlComplexOffline.text.includes('双机接力体检卡'));
+
+  await ctx.disposeAll();
 });

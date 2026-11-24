@@ -31,6 +31,7 @@ import {
   createActiveWorkspaceWatcher,
 } from '../lib/deliverable-plane.js';
 import { SoulSyncController } from '../lib/index.js';
+import { parseBooleanToggle } from '../lib/nl-router.js';
 
 const execFile = promisify(execFileCb);
 
@@ -162,6 +163,7 @@ function parseArgv(argv) {
     maxWorkspaceMB: null,
     retain: null,
     stepSyncMs: null,
+    stepSync: null,
     trashDays: null,
     workspace: null,
     force: false,
@@ -191,6 +193,16 @@ function parseArgv(argv) {
       flags.nonInteractive = true;
     } else if (arg === '--no-passphrase') {
       flags.noPassphrase = true;
+    } else if (arg === '--no-step-sync') {
+      flags.stepSync = false;
+    } else if (arg === '--step-sync' || arg.startsWith('--step-sync=')) {
+      const r = takeValue(argv, i, '--step-sync');
+      const parsedBool = parseBooleanToggle(r.value);
+      if (parsedBool === null) {
+        throw new Error(`参数 --step-sync 仅支持 on/off/true/false/1/0，当前收到：${r.value}`);
+      }
+      flags.stepSync = parsedBool;
+      i = r.nextIdx;
     } else if (arg === '--force') {
       flags.force = true;
     } else if (arg === '--dsh-home' || arg.startsWith('--dsh-home=')) {
@@ -336,12 +348,12 @@ function formatHelpText() {
     '  watch     启动轻量级后台守护模式，自动监测并周期备份会话与产出物',
     '',
     '常用示例：',
-    '  dsh-soul init --non-interactive --vault "D:\\OneDrive\\dsh-vault" --passphrase "我的口令" --map "us=D:\\美股分析::/Users/me/美股分析"',
+    '  dsh-soul init --non-interactive --vault "D:\\OneDrive\\dsh-vault" --passphrase "我的口令" --map "us=D:\\美股分析::/Users/me/美股分析" [--no-step-sync]',
     '  dsh-soul status',
     '  dsh-soul push',
     '  dsh-soul pull',
     '  dsh-soul keep outputs/valuation.xlsx',
-    '  dsh-soul config maxFileMB=64 retainSnapshots=15',
+    '  dsh-soul config maxFileMB=64 retainSnapshots=15 stepSync=off',
     '  dsh-soul doctor',
   ].join('\n');
 }
@@ -353,6 +365,9 @@ async function runInit(flags, dshHome, io) {
   let passphrase = flags.passphrase;
   let clearPassphrase = flags.noPassphrase;
   let deviceLabel = flags.deviceLabel ?? existing.deviceLabel ?? (os.hostname() || 'my-device');
+  let stepSyncEnabled = flags.stepSync !== null
+    ? flags.stepSync
+    : (typeof existing.stepSyncEnabled === 'boolean' ? existing.stepSyncEnabled : true);
   const mapSpecs = [...flags.maps];
 
   if (!flags.nonInteractive && io.isTTY) {
@@ -381,6 +396,14 @@ async function runInit(flags, dshHome, io) {
           const ansMap = (await rl.question('   添加映射: ')).trim();
           if (!ansMap) break;
           mapSpecs.push(ansMap);
+        }
+      }
+      if (flags.stepSync === null) {
+        const ansStep = (await rl.question('是否开启运行中每 30 秒步级防断电快照？[Y/n，默认开启，稳妥派可输入 n 关闭]: ')).trim().toLowerCase();
+        if (ansStep === 'n' || ansStep === 'no' || ansStep === 'off' || ansStep === 'false' || ansStep === '0') {
+          stepSyncEnabled = false;
+        } else if (ansStep === 'y' || ansStep === 'yes' || ansStep === 'on' || ansStep === 'true' || ansStep === '1') {
+          stepSyncEnabled = true;
         }
       }
     } finally {
@@ -429,6 +452,7 @@ async function runInit(flags, dshHome, io) {
     deviceLabel: deviceLabel || os.hostname() || 'my-device',
     platform: io.platform,
     encryptionEnabled,
+    stepSyncEnabled,
     workspaceMappings: mergedMappings,
     ...(flags.fallbackDir !== null ? { fallbackDir: flags.fallbackDir ? path.resolve(flags.fallbackDir) : '' } : {}),
     quotas: quotasPatch,
@@ -452,6 +476,7 @@ async function runInit(flags, dshHome, io) {
   io.out(`- DSH 目录: ${dshHome}`);
   io.out(`- 防灾金库: ${saved.vaultDir}`);
   io.out(`- 加密模式: ${saved.encryptionEnabled ? 'AES-256-GCM 已开启（密钥仅保存在本机 soul-sync/secret.key，绝不进入金库）' : '明文模式'}`);
+  io.out(`- 步级快照: ${saved.stepSyncEnabled !== false ? '已开启（运行中每 30 秒自动防断电快照）' : '已关闭（仅在每轮对话结束时安全同步）'}`);
   io.out(`- 设备身份: ${saved.deviceLabel} (${saved.deviceId} / ${io.platform})`);
   io.out(`- 工作区映射: ${saved.workspaceMappings.length} 个`);
   for (const m of saved.workspaceMappings) {

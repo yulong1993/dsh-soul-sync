@@ -7,6 +7,7 @@ param(
     [switch]$NoPassphrase,
     [string]$DeviceLabel = "",
     [string[]]$Map = @(),
+    [switch]$DisableStepSync,
     [switch]$SkipDesktop,
     [switch]$SkipWeb,
     [switch]$NonInteractive
@@ -184,6 +185,9 @@ foreach ($m in $Map) {
     if ($m -and $m.Trim().Length -gt 0) {
         $InitArgs += @("--map", $m)
     }
+}
+if ($DisableStepSync) {
+    $InitArgs += "--no-step-sync"
 }
 
 Write-Host ""
