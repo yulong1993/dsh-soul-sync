@@ -1011,6 +1011,8 @@ async function runWatch(flags, dshHome, io) {
   return 0;
 }
 
+const VALID_PLATFORMS = new Set(['win32', 'darwin', 'linux']);
+
 export async function runCli(argv = [], ioOverrides = {}) {
   const io = makeIo(ioOverrides);
   let parsed;
@@ -1022,6 +1024,14 @@ export async function runCli(argv = [], ioOverrides = {}) {
   }
 
   const { flags, positionals } = parsed;
+
+  if (flags.platform !== null) {
+    if (!VALID_PLATFORMS.has(flags.platform)) {
+      io.err(`参数错误：--platform 仅支持 win32 / darwin / linux，当前收到：${flags.platform}`);
+      return 1;
+    }
+    io.platform = flags.platform;
+  }
 
   if (flags.version) {
     io.out(`dsh-soul ${await readPackageVersion()}`);

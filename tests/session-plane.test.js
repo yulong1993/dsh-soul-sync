@@ -823,4 +823,163 @@ test.describe('session-plane: true split-brain zero-shift fork & safety guards',
     assert.equal(res.commit.targetId, 'snap-1');
     assert.equal(res.commit.payload.nodes[0].eventCount, 2);
   });
+
+  test('unmapped fallback session with working-directory/change & absolute deliverables/presented does not false-fork on repeated pull', async () => {
+    const srcHome = path.join(TEST_TMP_ROOT, 'case6-src-home');
+    const dstHome = path.join(TEST_TMP_ROOT, 'case6-dst-home');
+    const vaultDir = path.join(TEST_TMP_ROOT, 'case6-vault');
+    const fallbackRoot = path.join(TEST_TMP_ROOT, 'case6-fallback');
+
+    const srcVault = new VaultStore({ vaultDir, deviceId: 'mac-src-fb', platform: 'darwin' });
+    const dstVault = new VaultStore({ vaultDir, deviceId: 'win-dst-fb', platform: 'win32' });
+
+    const rootId = 'session-unmapped-fb-001';
+    const childId = 'session-unmapped-fb-child-001';
+
+    await writeLocalSession(
+      srcHome,
+      { type: 'session', version: 4, id: rootId, createdAt: 1000, cwd: '/Users/alex/unmapped-alpha', isSeeded: false, delegationDepth: 0 },
+      [
+        { seq: 0, time: 1001, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'check unmapped' }] } },
+        { seq: 1, time: 1002, type: 'working-directory/change', data: { cwd: '/Users/alex/unmapped-alpha/subdir' } },
+        { seq: 2, time: 1003, type: 'deliverables/presented', data: { files: [{ path: '/Users/alex/unmapped-alpha/subdir/out.xlsx' }] } },
+        { seq: 3, time: 1004, type: 'subagent/catalog', data: { childId } },
+      ],
+    );
+    await writeLocalSession(
+      srcHome,
+      { type: 'session', version: 4, id: childId, parentSession: rootId, origin: 'subagent', createdAt: 1005, cwd: '/Users/alex/unmapped-alpha/subdir', isSeeded: false, delegationDepth: 1 },
+      [
+        { seq: 0, time: 1006, type: 'working-directory/change', data: { cwd: '/Users/alex/unmapped-alpha/subdir/nested' } },
+        { seq: 1, time: 1007, type: 'assistant/message', data: { stream: [{ type: 'text', text: 'child done' }] } },
+      ],
+    );
+
+    await exportSessionClosure({
+      dshHome: srcHome,
+      vault: srcVault,
+      sessionId: rootId,
+      workspaceMappings: [],
+      deviceLabel: 'MacBook',
+    });
+
+    const pull1 = await pullSessionsFromVault({
+      dshHome: dstHome,
+      vault: dstVault,
+      workspaceMappings: [],
+      targetPlatform: 'win32',
+      fallbackRoot,
+    });
+    assert.equal(pull1.summary.imported, 1);
+    assert.equal(pull1.summary.forkedBranches, 0);
+
+    // Second pull of the exact same unmapped commit MUST report upToDate: 1 and forkedBranches: 0
+    const pull2 = await pullSessionsFromVault({
+      dshHome: dstHome,
+      vault: dstVault,
+      workspaceMappings: [],
+      targetPlatform: 'win32',
+      fallbackRoot,
+    });
+    assert.equal(pull2.summary.upToDate, 1);
+    assert.equal(pull2.summary.forkedBranches, 0);
+  });
+
+  test('offline session_projcache invalidation rejects path traversal IDs and online SessionAlreadyOwnedError returns deferred-busy', async () => {
+    const srcHome = path.join(TEST_TMP_ROOT, 'case7-src-home');
+    const dstHome = path.join(TEST_TMP_ROOT, 'case7-dst-home');
+    const vaultDir = path.join(TEST_TMP_ROOT, 'case7-vault');
+
+    const srcVault = new VaultStore({ vaultDir, deviceId: 'mac-src-sec', platform: 'darwin' });
+    const dstVault = new VaultStore({ vaultDir, deviceId: 'win-dst-sec', platform: 'win32' });
+
+    // 1. Offline cache traversal guard: plant a file outside session_projcache/sessions/
+    const outsideVictim = path.join(dstHome, 'storages', 'victim-outside.json');
+    await writeFileAtomic(outsideVictim, '{"safe":true}\n', { mode: 0o600 });
+
+    const craftedId = '../../victim-outside';
+    await writeLocalSession(
+      srcHome,
+      { type: 'session', version: 4, id: craftedId, createdAt: 1000, cwd: '/Users/alex/sec', isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1001, type: 'user/message', data: { content: [{ type: 'text', text: 'probe' }] } }],
+    );
+    const { commit: craftedCommit } = await exportSessionClosure({
+      dshHome: srcHome,
+      vault: srcVault,
+      sessionId: craftedId,
+    });
+    await importSessionCommit({
+      dshHome: dstHome,
+      vault: dstVault,
+      commit: craftedCommit,
+      targetPlatform: 'win32',
+      fallbackRoot: path.join(TEST_TMP_ROOT, 'case7-fb'),
+    });
+    // Victim file outside session_projcache/sessions/ MUST still exist!
+    assert.equal(await fs.readFile(outsideVictim, 'utf8'), '{"safe":true}\n');
+
+    // 2. Online SessionAlreadyOwnedError on sessionPersistence.open gracefully returns deferred-busy without aborting batch
+    const busySid = 'session-busy-owned-01';
+    const okSid = 'session-other-ok-02';
+    const localCwd = path.join(TEST_TMP_ROOT, 'case7-ws');
+    await fs.mkdir(localCwd, { recursive: true });
+    const mappings = [{ id: 'w7', title: 'W7', win32: localCwd, darwin: '/Users/alex/w7' }];
+
+    // Seed busySid locally with 1 event so remote 2 events triggers fast-forward via sessionPersistence.open
+    const ev0 = { seq: 0, time: 2000, type: 'user/message', data: { content: [{ type: 'text', text: 'turn 1' }] } };
+    const ev1 = { seq: 1, time: 2005, type: 'assistant/message', data: { stream: [{ type: 'text', text: 'turn 2' }] } };
+    await writeLocalSession(
+      dstHome,
+      { type: 'session', version: 4, id: busySid, createdAt: 2000, cwd: localCwd, isSeeded: false, delegationDepth: 0 },
+      [ev0],
+    );
+
+    const srcVault2 = new VaultStore({ vaultDir: path.join(TEST_TMP_ROOT, 'case7-vault2'), deviceId: 'mac-src-2', platform: 'darwin' });
+    const dstVault2 = new VaultStore({ vaultDir: path.join(TEST_TMP_ROOT, 'case7-vault2'), deviceId: 'win-dst-2', platform: 'win32' });
+    const srcHome2 = path.join(TEST_TMP_ROOT, 'case7-src-home2');
+
+    await writeLocalSession(
+      srcHome2,
+      { type: 'session', version: 4, id: busySid, createdAt: 2000, cwd: '/Users/alex/w7', isSeeded: false, delegationDepth: 0 },
+      [ev0, ev1],
+    );
+    await writeLocalSession(
+      srcHome2,
+      { type: 'session', version: 4, id: okSid, createdAt: 2010, cwd: '/Users/alex/w7', isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 2011, type: 'user/message', data: { content: [{ type: 'text', text: 'second session' }] } }],
+    );
+    await exportSessionClosure({ dshHome: srcHome2, vault: srcVault2, sessionId: busySid, workspaceMappings: mappings });
+    await exportSessionClosure({ dshHome: srcHome2, vault: srcVault2, sessionId: okSid, workspaceMappings: mappings });
+
+    const mockCordisCtx = {
+      workspaceRegistry: {
+        async create(cwd) { return { id: 'ws-mock', cwd, async attachSession() {} }; },
+      },
+      sessionPersistence: {
+        async open(sid) {
+          if (sid === busySid) {
+            const err = new Error('Session is already owned by another active writer');
+            err.name = 'SessionAlreadyOwnedError';
+            throw err;
+          }
+          return { async append() {}, async flush() {}, async close() {} };
+        },
+      },
+      storageDomain: {
+        get() { return { table() { return { async delete() {} }; } }; },
+      },
+    };
+
+    const pullBatch = await pullSessionsFromVault({
+      dshHome: dstHome,
+      vault: dstVault2,
+      workspaceMappings: mappings,
+      targetPlatform: 'win32',
+      cordisCtx: mockCordisCtx,
+    });
+    assert.equal(pullBatch.summary.deferredBusy, 1);
+    assert.equal(pullBatch.summary.imported, 1);
+    const busyRes = pullBatch.results.find((r) => r.sessionId === busySid);
+    assert.equal(busyRes?.status, 'deferred-busy');
+  });
 });

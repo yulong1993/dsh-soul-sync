@@ -84,6 +84,27 @@ test('hygiene: .gitattributes, LF-only mac/bin scripts, and pure-ASCII PS 5.1 ze
     assert.equal(buf.includes(0x0D), false, `${rel} must contain zero CR (\\r) bytes`);
   }
 
+  // scripts/install-mac.sh must remain compatible with macOS default Bash 3.2 under `set -u`
+  // (empty array `${#ARR[@]}` throws `unbound variable` on Bash 3.2)
+  const macShText = await fs.readFile(path.join(REPO_ROOT, 'scripts', 'install-mac.sh'), 'utf8');
+  assert.doesNotMatch(
+    macShText,
+    /\$\{#(?:MAP_ARGS|PROFILES|INIT_ARGS|DOCTOR_ARGS)\[@\]\}/,
+    'scripts/install-mac.sh must not dereference potentially empty array lengths with ${#ARR[@]} under set -u',
+  );
+
+  // scripts/install-mac.sh and bin/dsh-soul.js must have 100755 executable file mode in Git index
+  const { stdout: lsFilesOut } = await execFile(
+    'git',
+    ['ls-files', '-s', 'scripts/install-mac.sh', 'bin/dsh-soul.js'],
+    { cwd: REPO_ROOT, windowsHide: true },
+  );
+  const modeLines = lsFilesOut.trim().split(/\r?\n/).filter(Boolean);
+  assert.equal(modeLines.length, 2, 'expected both scripts/install-mac.sh and bin/dsh-soul.js to be tracked by git');
+  for (const line of modeLines) {
+    assert.match(line, /^100755\s+/, `expected git mode 100755, got: ${line}`);
+  }
+
   // scripts/install-win.ps1 must be 100% pure ASCII bytes so Chinese Windows PS 5.1 never mis-decodes UTF-8 as GBK
   const ps1Path = path.join(REPO_ROOT, 'scripts', 'install-win.ps1');
   const ps1Buf = await fs.readFile(ps1Path);
@@ -303,6 +324,40 @@ test('bin/dsh-soul.js full CLI roundtrip: Win init+keep+push -> Encrypted Vault 
   const watchCode = await runCli(['--dsh-home', macHome, 'watch', '--interval-ms', '60'], watchIo);
   assert.equal(watchCode, 0, watchIo.getStderr());
   assert.match(watchIo.getStdout(), /已优雅退出/);
+});
+
+test('bin/dsh-soul.js CLI --platform flag overrides io.platform and rejects invalid platform values', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'cli-platform-flag');
+  const dshHome = path.join(caseDir, 'home');
+  const vaultDir = path.join(caseDir, 'vault');
+
+  // Pass --platform darwin explicitly without ioOverrides.platform
+  const initIo = makeMemoryIo();
+  const initCode = await runCli(
+    [
+      '--dsh-home', dshHome,
+      '--platform', 'darwin',
+      'init',
+      '--non-interactive',
+      '--vault', vaultDir,
+      '--no-passphrase',
+      '--device-label', 'OverridePlatformMac',
+    ],
+    initIo,
+  );
+  assert.equal(initCode, 0, initIo.getStderr());
+  assert.match(initIo.getStdout(), /darwin/);
+  const cfg = await loadConfig(dshHome);
+  assert.equal(cfg.platform, 'darwin');
+
+  // Invalid platform value must fail with exit code 1
+  const badIo = makeMemoryIo();
+  const badCode = await runCli(
+    ['--dsh-home', dshHome, '--platform', 'solaris', 'status'],
+    badIo,
+  );
+  assert.equal(badCode, 1);
+  assert.match(badIo.getStderr(), /--platform/);
 });
 
 const LOCAL_DSH_DIR = process.env.LOCALAPPDATA

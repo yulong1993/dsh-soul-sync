@@ -553,6 +553,13 @@ test('/soul commands: status (Flash vs V4Pro + Office lock), handoff (agent.stee
   const hbsAfterHandoff = await macVault.readHeartbeats();
   const winHb = hbsAfterHandoff.find((h) => h.deviceId === 'win-office-02');
   assert.equal(winHb?.baton?.state, 'released-for-handoff');
+  assert.equal(winHb?.baton?.note, undefined, 'encrypted mode must omit plaintext baton.note from heartbeat.json');
+  const rawWinHbText = await fs.readFile(path.join(vaultDir, 'devices', 'win-office-02', 'heartbeat.json'), 'utf8');
+  assert.equal(
+    rawWinHbText.includes('晚上回家用 Mac 继续拆利润表'),
+    false,
+    'encrypted mode heartbeat.json must not leak plaintext handoff note',
+  );
 
   // 3) Close Excel (remove ~$ lock) -> /soul pull drains .dsh-incoming/ into outputs/估值表.xlsx!
   await fs.rm(winLockPath, { force: true });
@@ -672,4 +679,56 @@ test('SoulSyncController._detectDefaultModelTriple reads cordis.patch.yml before
     model: 'deepseek-flash',
     reasoningEffort: 'medium',
   });
+});
+
+test('/soul config vaultDir hot-rebuilds controller.vault and tools/result extracts payload.meta & payload.result.meta paths', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'config-vault-and-meta');
+  const dshHome = path.join(caseDir, 'home');
+  const vaultA = path.join(caseDir, 'vault-a');
+  const vaultB = path.join(caseDir, 'vault-b');
+  const wsDir = path.join(caseDir, 'ws');
+  await fs.mkdir(vaultA, { recursive: true });
+  await fs.mkdir(vaultB, { recursive: true });
+  await fs.mkdir(path.join(wsDir, 'outputs'), { recursive: true });
+
+  await saveConfig(dshHome, {
+    deviceId: 'win-hot-cfg',
+    deviceLabel: 'HotConfigWin',
+    platform: 'win32',
+    vaultDir: vaultA,
+    encryptionEnabled: false,
+    workspaceMappings: [{ id: 'ws-hot', title: 'Hot', win32: wsDir, darwin: '/Users/me/hot' }],
+  });
+
+  const controller = new SoulSyncController(null, { dshHome, platform: 'win32', minQuietMs: 0 });
+  await controller.reloadConfig();
+  assert.equal(controller.vault.vaultDir, path.resolve(vaultA));
+
+  // Hot-update vaultDir via handleConfig -> controller.vault must immediately point to vaultB
+  const cfgRes = await controller.handleConfig({ argsText: `vaultDir=${vaultB}` });
+  assert.equal(cfgRes.kind, 'success');
+  assert.equal(controller.vault.vaultDir, path.resolve(vaultB));
+
+  // Unsupported key error message must include vaultDir and fallbackDir
+  const unknownRes = await controller.handleConfig({ argsText: 'noSuchKey=123' });
+  assert.equal(unknownRes.kind, 'error');
+  assert.ok(unknownRes.text.includes('vaultDir'));
+  assert.ok(unknownRes.text.includes('fallbackDir'));
+
+  // extractToolPaths via handleToolsResult must capture payload.meta.path and payload.result.meta.path
+  await controller.handleToolsResult({
+    toolName: 'write_file',
+    cwd: wsDir,
+    meta: { path: path.join(wsDir, 'outputs', 'from-meta.txt') },
+  });
+  await controller.handleToolsResult({
+    toolName: 'edit_file',
+    cwd: wsDir,
+    result: { meta: { path: 'outputs/from-result-meta.txt' } },
+  });
+
+  const wsState = await loadWorkspaceDeliverableState(dshHome, 'ws-hot');
+  assert.ok(wsState.trackedPaths['outputs/from-meta.txt'], 'payload.meta.path should be tracked');
+  assert.ok(wsState.trackedPaths['outputs/from-result-meta.txt'], 'payload.result.meta.path should be tracked');
+  await controller.dispose();
 });

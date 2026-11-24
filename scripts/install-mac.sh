@@ -11,6 +11,7 @@ SKIP_DESKTOP=0
 SKIP_WEB=0
 NON_INTERACTIVE=0
 MAP_ARGS=()
+MAP_COUNT=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -33,9 +34,9 @@ while [ $# -gt 0 ]; do
     --device-label=*)
       DEVICE_LABEL_ARG="${1#*=}"; shift ;;
     --map)
-      MAP_ARGS+=("$2"); shift 2 ;;
+      MAP_ARGS+=("$2"); MAP_COUNT=$((MAP_COUNT + 1)); shift 2 ;;
     --map=*)
-      MAP_ARGS+=("${1#*=}"); shift ;;
+      MAP_ARGS+=("${1#*=}"); MAP_COUNT=$((MAP_COUNT + 1)); shift ;;
     --skip-desktop)
       SKIP_DESKTOP=1; shift ;;
     --skip-web)
@@ -132,22 +133,25 @@ fi
 if [ -n "$DEVICE_LABEL_ARG" ]; then
   INIT_ARGS+=("--device-label" "$DEVICE_LABEL_ARG")
 fi
-if [ ${#MAP_ARGS[@]} -gt 0 ]; then
-  for m in "${MAP_ARGS[@]}"; do
+if [ "$MAP_COUNT" -gt 0 ]; then
+  for m in ${MAP_ARGS[@]+"${MAP_ARGS[@]}"}; do
     INIT_ARGS+=("--map" "$m")
   done
 fi
 
 echo ""
 echo "[1/3] 正在初始化 Soul Sync 配置、金库与接力技能..."
-"$NODE_BIN" "${INIT_ARGS[@]}"
+"$NODE_BIN" ${INIT_ARGS[@]+"${INIT_ARGS[@]}"}
 
 PROFILES=()
+PROFILE_COUNT=0
 if [ "$SKIP_WEB" -eq 0 ]; then
   PROFILES+=("web")
+  PROFILE_COUNT=$((PROFILE_COUNT + 1))
 fi
 if [ "$SKIP_DESKTOP" -eq 0 ]; then
   PROFILES+=("desktop")
+  PROFILE_COUNT=$((PROFILE_COUNT + 1))
 fi
 
 echo ""
@@ -191,8 +195,8 @@ run_dsh_plugin_add() {
   return 0
 }
 
-if [ ${#PROFILES[@]} -gt 0 ]; then
-  for p in "${PROFILES[@]}"; do
+if [ "$PROFILE_COUNT" -gt 0 ]; then
+  for p in ${PROFILES[@]+"${PROFILES[@]}"}; do
     run_dsh_plugin_add "$p"
   done
 fi
@@ -203,7 +207,7 @@ DOCTOR_ARGS=("$CLI_ENTRY" "doctor")
 if [ -n "$DSH_HOME_ARG" ]; then
   DOCTOR_ARGS+=("--dsh-home" "$DSH_HOME_ARG")
 fi
-"$NODE_BIN" "${DOCTOR_ARGS[@]}"
+"$NODE_BIN" ${DOCTOR_ARGS[@]+"${DOCTOR_ARGS[@]}"}
 
 echo ""
 echo "安装全部完成！请重启 DeepSeek Harness，在对话框输入 /soul status 即可查看双机体检卡。"

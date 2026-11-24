@@ -16,6 +16,7 @@ import {
   detectOpenOfficeLocks,
   pushWorkspaceDeliverables,
   pullWorkspaceDeliverables,
+  loadWorkspaceDeliverableState,
 } from '../lib/deliverable-plane.js';
 
 const execFile = promisify(execFileCb);
@@ -450,6 +451,109 @@ test.describe('deliverable-plane: Office lock detection & .dsh-incoming staging 
     assert.ok(macPullUnlocked.drainedIncoming.includes('outputs/report.xlsx'));
     assert.deepEqual(await fs.readFile(path.join(macWs, 'outputs', 'report.xlsx')), v2);
     await assert.rejects(fs.stat(path.join(macWs, '.dsh-incoming', 'outputs', 'report.xlsx')));
+  });
+
+  test('drainIncomingFiles preserves local edits made while Excel locked and writes conflict copy instead of overwriting', async () => {
+    const baseDir = path.join(TEST_TMP_ROOT, 'case4b-drain-conflict');
+    const winHome = path.join(baseDir, 'win-home');
+    const macHome = path.join(baseDir, 'mac-home');
+    const vaultDir = path.join(baseDir, 'vault');
+    const winWs = path.join(baseDir, 'win-ws');
+    const macWs = path.join(baseDir, 'mac-ws');
+    await fs.mkdir(winWs, { recursive: true });
+    await fs.mkdir(macWs, { recursive: true });
+
+    const winVault = new VaultStore({ vaultDir, deviceId: 'win-office', platform: 'win32' });
+    const macVault = new VaultStore({ vaultDir, deviceId: 'mac-air', platform: 'darwin' });
+
+    const v1 = makeValidZipBuffer('model-base-v1');
+    const v2Remote = makeValidZipBuffer('model-remote-v2');
+    const vLocalEdit = makeValidZipBuffer('model-local-user-saved-while-locked');
+
+    // Step 1: Win pushes v1 -> Mac pulls v1 cleanly (establishes baseTree)
+    await writeFileEnsuringDir(path.join(winWs, 'outputs', 'model.xlsx'), v1);
+    await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-drain-conflict',
+      workspaceRoot: winWs,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    const macPull1 = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-drain-conflict',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPull1.status, 'synced');
+    assert.deepEqual(await fs.readFile(path.join(macWs, 'outputs', 'model.xlsx')), v1);
+
+    // Step 2: Mac opens outputs/model.xlsx in Excel (~$model.xlsx lock present)
+    const lockPath = path.join(macWs, 'outputs', '~$model.xlsx');
+    await writeFileEnsuringDir(lockPath, 'excel-lock');
+
+    // Step 3: Win updates outputs/model.xlsx to v2Remote and pushes
+    await fs.writeFile(path.join(winWs, 'outputs', 'model.xlsx'), v2Remote);
+    await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-drain-conflict',
+      workspaceRoot: winWs,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+
+    // Step 4: Mac pulls while locked -> v2Remote staged in .dsh-incoming/outputs/model.xlsx
+    const macPullLocked = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-drain-conflict',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPullLocked.stagedIncoming.length, 1);
+    assert.deepEqual(
+      await fs.readFile(path.join(macWs, '.dsh-incoming', 'outputs', 'model.xlsx')),
+      v2Remote,
+    );
+
+    // Step 5: User edits & saves local outputs/model.xlsx while Excel is open, then closes Excel (removes ~$ lock)
+    await fs.writeFile(path.join(macWs, 'outputs', 'model.xlsx'), vLocalEdit);
+    await fs.rm(lockPath, { force: true });
+
+    // Step 6: Mac pulls after unlock -> MUST preserve vLocalEdit, write v2Remote as conflict copy, and clear .dsh-incoming/
+    const macPullUnlocked = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-drain-conflict',
+      workspaceRoot: macWs,
+    });
+    assert.deepEqual(
+      await fs.readFile(path.join(macWs, 'outputs', 'model.xlsx')),
+      vLocalEdit,
+      'local Excel edits saved while locked must NEVER be overwritten by drainIncomingFiles',
+    );
+    const conflict = macPullUnlocked.conflicts.find((c) => c.path === 'outputs/model.xlsx');
+    assert.ok(conflict, 'must report a conflict copy when draining staged file over modified local file');
+    assert.equal(conflict.kind, 'both-modified');
+    assert.match(conflict.conflictPath, /^outputs\/model \(来自win-office \d{8}-\d{4}\)\.xlsx$/);
+    assert.deepEqual(
+      await fs.readFile(path.join(macWs, ...conflict.conflictPath.split('/'))),
+      v2Remote,
+    );
+    await assert.rejects(fs.stat(path.join(macWs, '.dsh-incoming', 'outputs', 'model.xlsx')));
+    const stateAfter = await loadWorkspaceDeliverableState(macHome, 'ws-drain-conflict');
+    assert.deepEqual(stateAfter.pendingIncoming, {});
+    assert.equal(stateAfter.baseTree['outputs/model.xlsx']?.sha256, sha256Hex(v2Remote));
+
+    // Step 7: Subsequent pull is idempotent (no duplicate conflict copies)
+    const macPullAgain = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-drain-conflict',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPullAgain.conflicts.length, 0);
   });
 });
 
