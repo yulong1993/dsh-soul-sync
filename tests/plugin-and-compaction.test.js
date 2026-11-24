@@ -616,3 +616,60 @@ test('skills/soul-handoff/SKILL.md: strict DSH YAML frontmatter and required wor
   assert.match(body, /deepseek-v4-pro/i);
   assert.match(body, /parallel\(\s*\(\)\s*=>\s*agent\(/);
 });
+
+test('SoulSyncController._detectDefaultModelTriple reads cordis.patch.yml before empty cordis.yml', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'detect-model-patch');
+
+  // Case 1: desktop profile has empty cordis.yml ([]) and agent-default-model in cordis.patch.yml (deepseek-v4-pro)
+  const homeV4 = path.join(caseDir, 'home-v4pro');
+  const desktopDir = path.join(homeV4, 'profiles', 'desktop');
+  await fs.mkdir(desktopDir, { recursive: true });
+  await fs.writeFile(path.join(desktopDir, 'cordis.yml'), '[]\n', 'utf8');
+  await fs.writeFile(
+    path.join(desktopDir, 'cordis.patch.yml'),
+    [
+      '- id: some-other-plugin',
+      '  config:',
+      '    enabled: true',
+      '- id: agent-default-model',
+      '  config:',
+      '    provider: deepseek',
+      '    model: deepseek-v4-pro',
+      '    reasoningEffort: high',
+    ].join('\n') + '\n',
+    'utf8',
+  );
+
+  const ctrlV4 = new SoulSyncController(null, { dshHome: homeV4, platform: 'win32' });
+  const tripleV4 = await ctrlV4._detectDefaultModelTriple();
+  assert.deepEqual(tripleV4, {
+    provider: 'deepseek',
+    model: 'deepseek-v4-pro',
+    reasoningEffort: 'high',
+  });
+
+  // Case 2: web profile has empty cordis.yml and deepseek-flash in cordis.patch.yml
+  const homeFlash = path.join(caseDir, 'home-flash');
+  const webDir = path.join(homeFlash, 'profiles', 'web');
+  await fs.mkdir(webDir, { recursive: true });
+  await fs.writeFile(path.join(webDir, 'cordis.yml'), '[]\n', 'utf8');
+  await fs.writeFile(
+    path.join(webDir, 'cordis.patch.yml'),
+    [
+      '- id: agent-default-model',
+      '  config:',
+      '    provider: deepseek',
+      '    model: deepseek-flash',
+      '    reasoningEffort: medium',
+    ].join('\n') + '\n',
+    'utf8',
+  );
+
+  const ctrlFlash = new SoulSyncController(null, { dshHome: homeFlash, platform: 'darwin' });
+  const tripleFlash = await ctrlFlash._detectDefaultModelTriple();
+  assert.deepEqual(tripleFlash, {
+    provider: 'deepseek',
+    model: 'deepseek-flash',
+    reasoningEffort: 'medium',
+  });
+});

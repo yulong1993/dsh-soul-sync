@@ -1,0 +1,1085 @@
+#!/usr/bin/env node
+import { execFile as execFileCb } from 'node:child_process';
+import crypto from 'node:crypto';
+import fsSync from 'node:fs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import readline from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+import {
+  DEFAULT_QUOTAS,
+  GLOBAL_AGENTS_RULES_MARKER,
+  resolveDshHome,
+  soulSyncDir,
+  loadConfig,
+  saveConfig,
+  savePassphraseKey,
+  loadPassphraseKey,
+  ensureGlobalAgentsRules,
+  writeFileAtomic,
+} from '../lib/config.js';
+import { scanLocalSessions, pullSessionsFromVault, exportAllLocalSessions } from '../lib/session-plane.js';
+import {
+  recordDeliverableCandidate,
+  pushWorkspaceDeliverables,
+  pullWorkspaceDeliverables,
+  loadWorkspaceDeliverableState,
+  detectOpenOfficeLocks,
+  createActiveWorkspaceWatcher,
+} from '../lib/deliverable-plane.js';
+import { SoulSyncController } from '../lib/index.js';
+
+const execFile = promisify(execFileCb);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '..');
+
+function createWriter(target, fallbackStream) {
+  if (typeof target === 'function') {
+    return (text) => target(String(text));
+  }
+  if (target && typeof target.write === 'function') {
+    return (text) => target.write(String(text));
+  }
+  return (text) => fallbackStream.write(String(text));
+}
+
+function makeIo(io = {}) {
+  const writeOut = createWriter(io.stdout, process.stdout);
+  const writeErr = createWriter(io.stderr, process.stderr);
+  return {
+    out: (line = '') => writeOut(`${line}\n`),
+    err: (line = '') => writeErr(`${line}\n`),
+    stdin: io.stdin ?? process.stdin,
+    stdoutStream: typeof io.stdout === 'object' && io.stdout?.write ? io.stdout : process.stdout,
+    platform: io.platform ?? process.platform,
+    env: io.env ?? process.env,
+    isTTY: typeof io.isTTY === 'boolean' ? io.isTTY : Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    checkDesktopRunning: io.checkDesktopRunning ?? defaultCheckDesktopRunning,
+    signal: io.signal ?? null,
+    minQuietMs: typeof io.minQuietMs === 'number' ? io.minQuietMs : undefined,
+  };
+}
+
+async function pathExists(targetPath) {
+  if (!targetPath) return false;
+  try {
+    await fs.stat(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function extractDirBasename(rawPath) {
+  if (!rawPath) return '';
+  const cleaned = String(rawPath).trim().replace(/[\\/]+$/, '');
+  const idx = Math.max(cleaned.lastIndexOf('/'), cleaned.lastIndexOf('\\'));
+  return (idx >= 0 ? cleaned.slice(idx + 1) : cleaned).normalize('NFC');
+}
+
+function deriveWorkspaceId(winPath, macPath) {
+  const base = extractDirBasename(winPath) || extractDirBasename(macPath) || 'workspace';
+  const safe = base
+    .normalize('NFC')
+    .replace(/[<>:"/\\|?*\s]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (safe.length > 0) return safe;
+  return `ws-${crypto.createHash('sha256').update(`${winPath}::${macPath}`).digest('hex').slice(0, 6)}`;
+}
+
+/**
+ * Parse `--map` value in either `id=winPath::macPath` or `winPath::macPath` format.
+ */
+export function parseWorkspaceMappingSpec(rawSpec) {
+  const spec = String(rawSpec ?? '').trim();
+  if (!spec) {
+    throw new Error('空的工作区映射参数（格式应为 winPath::macPath 或 id=winPath::macPath）');
+  }
+  const sepIdx = spec.indexOf('::');
+  if (sepIdx === -1) {
+    throw new Error(`无效的工作区映射「${spec}」，必须包含 "::" 分隔 Windows 与 macOS 路径`);
+  }
+
+  const leftPart = spec.slice(0, sepIdx).trim();
+  const rightPart = spec.slice(sepIdx + 2).trim();
+
+  let id = '';
+  let winPath = leftPart;
+  const eqIdx = leftPart.indexOf('=');
+  if (eqIdx > 0 && !leftPart.slice(0, eqIdx).includes('\\') && !leftPart.slice(0, eqIdx).includes('/') && !leftPart.slice(0, eqIdx).includes(':')) {
+    id = leftPart.slice(0, eqIdx).trim();
+    winPath = leftPart.slice(eqIdx + 1).trim();
+  }
+
+  const macPath = rightPart;
+  if (!winPath && !macPath) {
+    throw new Error(`无效的工作区映射「${spec}」，Windows 与 macOS 路径不能同时为空`);
+  }
+
+  const title = extractDirBasename(winPath) || extractDirBasename(macPath) || id || 'workspace';
+  const finalId = id || deriveWorkspaceId(winPath, macPath);
+
+  return {
+    id: finalId,
+    title,
+    ...(winPath ? { win32: winPath.normalize('NFC') } : {}),
+    ...(macPath ? { darwin: macPath.normalize('NFC') } : {}),
+  };
+}
+
+function mergeWorkspaceMappings(existingList, additions) {
+  const byId = new Map();
+  for (const m of existingList ?? []) {
+    if (m?.id) byId.set(m.id, { ...m });
+  }
+  for (const m of additions ?? []) {
+    if (!m?.id) continue;
+    const prev = byId.get(m.id) ?? {};
+    byId.set(m.id, { ...prev, ...m });
+  }
+  return [...byId.values()];
+}
+
+function parseArgv(argv) {
+  const flags = {
+    dshHome: null,
+    platform: null,
+    help: false,
+    version: false,
+    nonInteractive: false,
+    vault: null,
+    passphrase: null,
+    noPassphrase: false,
+    deviceLabel: null,
+    maps: [],
+    fallbackDir: null,
+    maxFileMB: null,
+    maxWorkspaceMB: null,
+    retain: null,
+    stepSyncMs: null,
+    trashDays: null,
+    workspace: null,
+    force: false,
+    intervalMs: null,
+  };
+  const positionals = [];
+
+  const takeValue = (args, idx, name) => {
+    const cur = args[idx];
+    const eqIdx = cur.indexOf('=');
+    if (eqIdx !== -1) {
+      return { value: cur.slice(eqIdx + 1), nextIdx: idx };
+    }
+    if (idx + 1 >= args.length) {
+      throw new Error(`参数 ${name} 缺少取值`);
+    }
+    return { value: args[idx + 1], nextIdx: idx + 1 };
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      flags.help = true;
+    } else if (arg === '--version' || arg === '-v') {
+      flags.version = true;
+    } else if (arg === '--non-interactive') {
+      flags.nonInteractive = true;
+    } else if (arg === '--no-passphrase') {
+      flags.noPassphrase = true;
+    } else if (arg === '--force') {
+      flags.force = true;
+    } else if (arg === '--dsh-home' || arg.startsWith('--dsh-home=')) {
+      const r = takeValue(argv, i, '--dsh-home');
+      flags.dshHome = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--platform' || arg.startsWith('--platform=')) {
+      const r = takeValue(argv, i, '--platform');
+      flags.platform = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--vault' || arg.startsWith('--vault=')) {
+      const r = takeValue(argv, i, '--vault');
+      flags.vault = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--passphrase' || arg.startsWith('--passphrase=')) {
+      const r = takeValue(argv, i, '--passphrase');
+      flags.passphrase = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--device-label' || arg.startsWith('--device-label=')) {
+      const r = takeValue(argv, i, '--device-label');
+      flags.deviceLabel = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--map' || arg.startsWith('--map=')) {
+      const r = takeValue(argv, i, '--map');
+      flags.maps.push(r.value);
+      i = r.nextIdx;
+    } else if (arg === '--fallback-dir' || arg.startsWith('--fallback-dir=')) {
+      const r = takeValue(argv, i, '--fallback-dir');
+      flags.fallbackDir = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--max-file-mb' || arg.startsWith('--max-file-mb=')) {
+      const r = takeValue(argv, i, '--max-file-mb');
+      flags.maxFileMB = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--max-workspace-mb' || arg.startsWith('--max-workspace-mb=')) {
+      const r = takeValue(argv, i, '--max-workspace-mb');
+      flags.maxWorkspaceMB = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--retain' || arg.startsWith('--retain=')) {
+      const r = takeValue(argv, i, '--retain');
+      flags.retain = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--step-sync-ms' || arg.startsWith('--step-sync-ms=')) {
+      const r = takeValue(argv, i, '--step-sync-ms');
+      flags.stepSyncMs = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--trash-days' || arg.startsWith('--trash-days=')) {
+      const r = takeValue(argv, i, '--trash-days');
+      flags.trashDays = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--workspace' || arg.startsWith('--workspace=')) {
+      const r = takeValue(argv, i, '--workspace');
+      flags.workspace = r.value;
+      i = r.nextIdx;
+    } else if (arg === '--interval-ms' || arg.startsWith('--interval-ms=')) {
+      const r = takeValue(argv, i, '--interval-ms');
+      flags.intervalMs = r.value;
+      i = r.nextIdx;
+    } else if (arg.startsWith('-')) {
+      throw new Error(`未知参数：${arg}`);
+    } else {
+      positionals.push(arg);
+    }
+  }
+
+  return { flags, positionals };
+}
+
+function parsePositiveNumber(raw, label, { integer = false } = {}) {
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num <= 0 || (integer && !Number.isInteger(num))) {
+    throw new Error(`参数 ${label} 必须为正${integer ? '整' : ''}数，当前收到：${raw}`);
+  }
+  return num;
+}
+
+async function defaultCheckDesktopRunning(platform = process.platform) {
+  try {
+    if (platform === 'win32') {
+      const { stdout } = await execFile(
+        'tasklist',
+        ['/FI', 'IMAGENAME eq DeepSeek Harness.exe', '/FO', 'CSV', '/NH'],
+        { windowsHide: true, timeout: 4000 },
+      );
+      const lines = String(stdout ?? '')
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith('"DeepSeek Harness.exe"'));
+      // Filter out current PID if somehow running inside Electron
+      const otherLines = lines.filter((line) => {
+        const cols = line.split('","');
+        const pid = Number((cols[1] ?? '').replace(/"/g, ''));
+        return pid !== process.pid && pid !== process.ppid;
+      });
+      return otherLines.length > 0;
+    }
+    const { stdout } = await execFile('pgrep', ['-x', 'DeepSeek Harness'], { timeout: 4000 });
+    return String(stdout ?? '').trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function syncHandoffSkill(dshHome) {
+  const srcPath = path.join(REPO_ROOT, 'skills', 'soul-handoff', 'SKILL.md');
+  const destPath = path.join(dshHome, 'skills', 'soul-handoff', 'SKILL.md');
+  const content = await fs.readFile(srcPath, 'utf8');
+  await writeFileAtomic(destPath, content, { mode: 0o644 });
+  return destPath;
+}
+
+async function ensureVaultStructure(vaultDir) {
+  const resolved = path.resolve(vaultDir);
+  await fs.mkdir(path.join(resolved, 'blobs', 'sha256'), { recursive: true });
+  await fs.mkdir(path.join(resolved, 'devices'), { recursive: true });
+  return resolved;
+}
+
+async function readPackageVersion() {
+  try {
+    const pkg = JSON.parse(await fs.readFile(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+    return pkg.version || '0.1.0';
+  } catch {
+    return '0.1.0';
+  }
+}
+
+function formatHelpText() {
+  return [
+    'dsh-soul — DeepSeek Harness 跨设备防灾备份与灵魂接力独立 CLI',
+    '',
+    '用法：',
+    '  dsh-soul [--dsh-home <dir>] <子命令> [选项]',
+    '',
+    '子命令：',
+    '  init      初始化配置、防灾金库目录、可选口令加密、工作区映射与接力技能',
+    '  status    输出双机同步体检报告（金库、加密、模型档位、会话数、产出数与 Excel 锁）',
+    '  push      离线全量备份本地会话闭包、全局 AGENTS.md 与映射工作区产出物',
+    '  pull      离线从金库恢复/三路合并会话、AGENTS.md 与工作区产出物（支持 --force）',
+    '  keep      将指定文件手动纳入《产出账本》并立即推送至防灾金库',
+    '  config    查看或修改同步配额与基础配置（key=value）',
+    '  doctor    全面自检配置、金库读写、密钥、技能、规则块与 DSH 插件注册状态',
+    '  watch     启动轻量级后台守护模式，自动监测并周期备份会话与产出物',
+    '',
+    '常用示例：',
+    '  dsh-soul init --non-interactive --vault "D:\\OneDrive\\dsh-vault" --passphrase "我的口令" --map "us=D:\\美股分析::/Users/me/美股分析"',
+    '  dsh-soul status',
+    '  dsh-soul push',
+    '  dsh-soul pull',
+    '  dsh-soul keep outputs/valuation.xlsx',
+    '  dsh-soul config maxFileMB=64 retainSnapshots=15',
+    '  dsh-soul doctor',
+  ].join('\n');
+}
+
+async function runInit(flags, dshHome, io) {
+  const existing = await loadConfig(dshHome);
+
+  let vaultDir = flags.vault ?? existing.vaultDir ?? '';
+  let passphrase = flags.passphrase;
+  let clearPassphrase = flags.noPassphrase;
+  let deviceLabel = flags.deviceLabel ?? existing.deviceLabel ?? (os.hostname() || 'my-device');
+  const mapSpecs = [...flags.maps];
+
+  if (!flags.nonInteractive && io.isTTY) {
+    const rl = readline.createInterface({ input: io.stdin, output: io.stdoutStream });
+    try {
+      io.out('=== dsh-soul 初始化向导 ===');
+      if (!flags.vault) {
+        const ansVault = (await rl.question(`1. 请输入网盘防灾金库目录${vaultDir ? ` [默认: ${vaultDir}]` : ''}: `)).trim();
+        if (ansVault) vaultDir = ansVault;
+      }
+      if (passphrase === null && !clearPassphrase) {
+        const ansPass = await rl.question('2. 请输入端到端加密口令（直接回车表示明文模式；双端请保持一致）: ');
+        if (ansPass.trim().length > 0) {
+          passphrase = ansPass.trim();
+        } else {
+          clearPassphrase = true;
+        }
+      }
+      if (!flags.deviceLabel) {
+        const ansLabel = (await rl.question(`3. 本机昵称 [默认: ${deviceLabel}]: `)).trim();
+        if (ansLabel) deviceLabel = ansLabel;
+      }
+      if (mapSpecs.length === 0) {
+        io.out('4. 配置跨系统工作区路径配对（格式: D:\\美股分析::/Users/你的名字/美股分析 ，直接回车结束）：');
+        for (;;) {
+          const ansMap = (await rl.question('   添加映射: ')).trim();
+          if (!ansMap) break;
+          mapSpecs.push(ansMap);
+        }
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  if (!vaultDir || !vaultDir.trim()) {
+    io.err('错误：请通过 --vault <dir> 指定网盘防灾金库目录。');
+    return 1;
+  }
+
+  const resolvedVaultDir = await ensureVaultStructure(vaultDir);
+
+  const parsedMaps = mapSpecs.map((spec) => parseWorkspaceMappingSpec(spec));
+  const mergedMappings = mergeWorkspaceMappings(existing.workspaceMappings, parsedMaps);
+
+  const quotasPatch = {};
+  if (flags.maxFileMB !== null) {
+    quotasPatch.maxFileBytes = Math.round(parsePositiveNumber(flags.maxFileMB, '--max-file-mb') * 1024 * 1024);
+  }
+  if (flags.maxWorkspaceMB !== null) {
+    quotasPatch.maxWorkspaceBytes = Math.round(parsePositiveNumber(flags.maxWorkspaceMB, '--max-workspace-mb') * 1024 * 1024);
+  }
+  if (flags.retain !== null) {
+    quotasPatch.retainSnapshots = parsePositiveNumber(flags.retain, '--retain', { integer: true });
+  }
+  if (flags.stepSyncMs !== null) {
+    quotasPatch.stepSyncIntervalMs = Math.round(parsePositiveNumber(flags.stepSyncMs, '--step-sync-ms'));
+  }
+  if (flags.trashDays !== null) {
+    quotasPatch.trashRetentionDays = parsePositiveNumber(flags.trashDays, '--trash-days', { integer: true });
+  }
+
+  let encryptionEnabled = existing.encryptionEnabled;
+  if (clearPassphrase || (passphrase !== null && passphrase === '')) {
+    await savePassphraseKey(dshHome, '');
+    encryptionEnabled = false;
+  } else if (passphrase !== null) {
+    await savePassphraseKey(dshHome, passphrase);
+    encryptionEnabled = true;
+  }
+
+  const saved = await saveConfig(dshHome, {
+    vaultDir: resolvedVaultDir,
+    deviceLabel: deviceLabel || os.hostname() || 'my-device',
+    platform: io.platform,
+    encryptionEnabled,
+    workspaceMappings: mergedMappings,
+    ...(flags.fallbackDir !== null ? { fallbackDir: flags.fallbackDir ? path.resolve(flags.fallbackDir) : '' } : {}),
+    quotas: quotasPatch,
+  });
+
+  const agentsRes = await ensureGlobalAgentsRules(dshHome);
+  const skillDest = await syncHandoffSkill(dshHome);
+
+  // Initialize controller to write initial device heartbeat into vault
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+  if (controller.vault) {
+    await controller.updateHeartbeat({ status: 'initialized' });
+  }
+
+  io.out('初始化完成！');
+  io.out(`- DSH 目录: ${dshHome}`);
+  io.out(`- 防灾金库: ${saved.vaultDir}`);
+  io.out(`- 加密模式: ${saved.encryptionEnabled ? 'AES-256-GCM 已开启（密钥仅保存在本机 soul-sync/secret.key，绝不进入金库）' : '明文模式'}`);
+  io.out(`- 设备身份: ${saved.deviceLabel} (${saved.deviceId} / ${io.platform})`);
+  io.out(`- 工作区映射: ${saved.workspaceMappings.length} 个`);
+  for (const m of saved.workspaceMappings) {
+    io.out(`    · [${m.id}] Win=${m.win32 || '(未设)'} ⇄ Mac=${m.darwin || '(未设)'}`);
+  }
+  io.out(`- 全局规则: ${agentsRes.path}`);
+  io.out(`- 接力技能: ${skillDest}`);
+  return 0;
+}
+
+async function runStatus(dshHome, io) {
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+
+  const card = await controller.formatStatusCard();
+  io.out(card);
+
+  const localSessions = await scanLocalSessions(dshHome);
+  io.out(`- **本地会话总数**：${localSessions.size} 个`);
+
+  const mappings = controller.config?.workspaceMappings ?? [];
+  if (mappings.length === 0) {
+    io.out('- **映射工作区**：尚未配置（可通过 `dsh-soul init --map` 添加）');
+  } else {
+    io.out(`- **映射工作区详情**（共 ${mappings.length} 个）：`);
+    for (const m of mappings) {
+      const localRoot = m[io.platform];
+      const exists = localRoot ? await pathExists(localRoot) : false;
+      const wsState = await loadWorkspaceDeliverableState(dshHome, m.id);
+      const trackedCount = Object.keys(wsState.trackedPaths ?? {}).length;
+      const stagedCount = Object.keys(wsState.pendingIncoming ?? {}).length;
+      let lockText = '无占锁';
+      if (exists) {
+        const locks = await detectOpenOfficeLocks(localRoot, Object.keys(wsState.trackedPaths ?? {}));
+        if (locks.length > 0) {
+          lockText = `⚠️ 检测到 ${locks.length} 个 Excel/Office 锁 (${locks.map((l) => l.lockPath).join(', ')})`;
+        }
+      }
+      io.out(
+        `  - [${m.id}] ${localRoot || '(本系统未映射)'} ${exists ? '' : '[目录不存在] '}— 受管产出 ${trackedCount} 个 | .dsh-incoming 暂存 ${stagedCount} 个 | ${lockText}`,
+      );
+    }
+  }
+  return 0;
+}
+
+async function runPush(flags, dshHome, io) {
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+
+  if (!controller.vault) {
+    io.err('错误：尚未配置防灾金库或缺少加密密钥，请先运行 `dsh-soul init`。');
+    return 1;
+  }
+
+  const globalRes = await controller.syncGlobalAgentsMd();
+  const sessRes = await exportAllLocalSessions({
+    dshHome,
+    vault: controller.vault,
+    workspaceMappings: controller.config.workspaceMappings,
+    deviceLabel: controller.config.deviceLabel,
+  });
+
+  const pushedIds = new Set();
+  const wsResults = [];
+
+  for (const mapping of controller.config.workspaceMappings ?? []) {
+    const localRoot = mapping[io.platform];
+    if (!localRoot || !(await pathExists(localRoot))) continue;
+    pushedIds.add(mapping.id);
+    const res = await pushWorkspaceDeliverables({
+      dshHome,
+      vault: controller.vault,
+      workspaceId: mapping.id,
+      workspaceRoot: localRoot,
+      deviceLabel: controller.config.deviceLabel,
+      minQuietMs: io.minQuietMs ?? 0,
+      quotas: controller.config.quotas,
+    });
+    wsResults.push({ id: mapping.id, title: mapping.title, ...res });
+  }
+
+  if (flags.workspace) {
+    const resolvedWs = path.resolve(flags.workspace);
+    if (!(await pathExists(resolvedWs))) {
+      io.err(`错误：指定的工作区目录不存在：${resolvedWs}`);
+      return 1;
+    }
+    const matched = controller._matchWorkspaceForPath(resolvedWs);
+    const wsId = matched?.mapping?.id ?? deriveWorkspaceId(resolvedWs, resolvedWs);
+    if (!pushedIds.has(wsId)) {
+      const res = await pushWorkspaceDeliverables({
+        dshHome,
+        vault: controller.vault,
+        workspaceId: wsId,
+        workspaceRoot: matched?.localRoot ?? resolvedWs,
+        deviceLabel: controller.config.deviceLabel,
+        minQuietMs: io.minQuietMs ?? 0,
+        quotas: controller.config.quotas,
+      });
+      wsResults.push({ id: wsId, title: matched?.mapping?.title ?? wsId, ...res });
+    }
+  }
+
+  controller._lastBackupAt = Date.now();
+  await controller.updateHeartbeat({ status: 'active' });
+
+  const keepN = controller.config.quotas?.retainSnapshots ?? DEFAULT_QUOTAS.retainSnapshots;
+  await controller.vault.pruneHistory('session', keepN).catch(() => {});
+  await controller.vault.pruneHistory('workspace', keepN).catch(() => {});
+
+  const totalUploaded = wsResults.reduce((sum, w) => sum + w.uploaded.length, 0);
+  const totalDeleted = wsResults.reduce((sum, w) => sum + w.deleted.length, 0);
+  const totalDeferred = wsResults.reduce((sum, w) => sum + w.deferred.length, 0);
+  const totalBlocked = wsResults.reduce((sum, w) => sum + w.blocked.length, 0);
+  const openLocks = wsResults.flatMap((w) => w.openLocks ?? []);
+
+  io.out(
+    `推送完成：会话闭包 ${sessRes.exported.length} 个（AGENTS.md ${globalRes.published ? '已更新' : '无变化'}）；工作区产出上传 ${totalUploaded} / 删除 ${totalDeleted} / 延后 ${totalDeferred} / 拦截 ${totalBlocked}。`,
+  );
+  if (openLocks.length > 0) {
+    io.out(`⚠️ 检测到未关闭的 Office 锁文件：${openLocks.map((l) => l.lockPath).join('、')}`);
+  }
+  return 0;
+}
+
+async function runPull(flags, dshHome, io) {
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+
+  if (!controller.vault) {
+    io.err('错误：尚未配置防灾金库或缺少加密密钥，请先运行 `dsh-soul init`。');
+    return 1;
+  }
+
+  const desktopRunning = await io.checkDesktopRunning(io.platform);
+  const skipSessions = desktopRunning && !flags.force;
+
+  if (skipSessions) {
+    io.out('⚠️ 检测到本机正在运行 DeepSeek Harness 桌面端：为避免与运行中的桌面端并发写入会话索引，本次已跳过离线会话导入。');
+    io.out('   建议在 DSH 对话框内执行 `/soul pull`，或先右键退出托盘 DeepSeek Harness 后重试（也可传 `--force` 强制离线导入）。');
+  }
+
+  const globalRes = await controller.syncGlobalAgentsMd();
+
+  let sessionSummary = { imported: 0, fastForwarded: 0, forkedBranches: 0, upToDate: 0 };
+  if (!skipSessions) {
+    const sessRes = await pullSessionsFromVault({
+      dshHome,
+      vault: controller.vault,
+      workspaceMappings: controller.config.workspaceMappings,
+      targetPlatform: io.platform,
+      fallbackRoot: controller.config.fallbackDir || undefined,
+    });
+    sessionSummary = sessRes.summary;
+  }
+
+  // Determine which workspaces have commits in the vault so disaster recovery on a fresh machine can auto-create localRoot
+  const { commits: allWsCommits } = await controller.vault.listCommits('workspace', { includeSelf: false });
+  const remoteWsIds = new Set(allWsCommits.map((c) => c.targetId));
+
+  const wsResults = [];
+  for (const mapping of controller.config.workspaceMappings ?? []) {
+    const localRoot = mapping[io.platform];
+    if (!localRoot) continue;
+    const exists = await pathExists(localRoot);
+    if (!exists && !remoteWsIds.has(mapping.id)) continue;
+    if (!exists) {
+      await fs.mkdir(localRoot, { recursive: true });
+    }
+    const wsRes = await pullWorkspaceDeliverables({
+      dshHome,
+      vault: controller.vault,
+      workspaceId: mapping.id,
+      workspaceRoot: localRoot,
+      trashRetentionDays: controller.config.quotas?.trashRetentionDays,
+    });
+    wsResults.push({ id: mapping.id, title: mapping.title, ...wsRes });
+  }
+
+  const totalApplied = wsResults.reduce((s, w) => s + w.applied.length, 0);
+  const totalDrained = wsResults.reduce((s, w) => s + w.drainedIncoming.length, 0);
+  const totalConflicts = wsResults.reduce((s, w) => s + w.conflicts.length, 0);
+  const totalStaged = wsResults.reduce((s, w) => s + w.stagedIncoming.length, 0);
+
+  io.out(
+    `拉取完成：AGENTS.md ${globalRes.pulled ? '已更新' : '最新'}；`
+    + (skipSessions
+      ? '会话导入已安全跳过（桌面端运行中）；'
+      : `会话新增 ${sessionSummary.imported} / 快进 ${sessionSummary.fastForwarded} / 分叉 ${sessionSummary.forkedBranches}；`)
+    + `产出更新 ${totalApplied} 个（排空 .dsh-incoming ${totalDrained} 个），冲突 ${totalConflicts} 个。`,
+  );
+  if (totalStaged > 0) {
+    io.out(`⚠️ 有 ${totalStaged} 个文件因本地 Excel/Office 占锁已暂存于 .dsh-incoming/，关闭软件后再次运行 dsh-soul pull 即可自动落位。`);
+  }
+  return 0;
+}
+
+async function runKeep(flags, args, dshHome, io) {
+  const target = args[0];
+  if (!target) {
+    io.err('用法：dsh-soul keep <文件路径> [--workspace <工作区目录>]');
+    return 1;
+  }
+
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+
+  let matched = null;
+  let resolvedTarget = target;
+
+  if (flags.workspace) {
+    const absWs = path.resolve(flags.workspace);
+    matched = controller._matchWorkspaceForPath(absWs);
+    if (!matched) {
+      const wsId = deriveWorkspaceId(absWs, absWs);
+      matched = { mapping: { id: wsId, title: wsId }, localRoot: absWs };
+    }
+    resolvedTarget = path.isAbsolute(target) ? target : path.resolve(matched.localRoot, target);
+  } else {
+    const absCandidate = path.isAbsolute(target) ? target : path.resolve(process.cwd(), target);
+    matched = controller._matchWorkspaceForPath(absCandidate) ?? controller._matchWorkspaceForPath(target);
+    if (matched) {
+      resolvedTarget = absCandidate;
+    } else if (controller.config.workspaceMappings.length === 1) {
+      const only = controller.config.workspaceMappings[0];
+      const localRoot = only[io.platform];
+      if (localRoot) {
+        matched = { mapping: only, localRoot };
+        resolvedTarget = path.isAbsolute(target) ? target : path.resolve(localRoot, target);
+      }
+    }
+  }
+
+  if (!matched) {
+    io.err(`错误：路径「${target}」未匹配到任何已配置工作区，请使用 --workspace <dir> 指定。`);
+    return 1;
+  }
+
+  const rec = await recordDeliverableCandidate(
+    dshHome,
+    matched.mapping.id,
+    matched.localRoot,
+    resolvedTarget,
+    'manual',
+  );
+  if (!rec.recorded) {
+    io.err(`错误：无法纳管「${target}」（原因：${rec.reason}）。`);
+    return 1;
+  }
+
+  if (controller.vault) {
+    const pushRes = await pushWorkspaceDeliverables({
+      dshHome,
+      vault: controller.vault,
+      workspaceId: matched.mapping.id,
+      workspaceRoot: matched.localRoot,
+      deviceLabel: controller.config.deviceLabel,
+      minQuietMs: io.minQuietMs ?? 0,
+      quotas: controller.config.quotas,
+    });
+    const blockedItem = pushRes.blocked.find((b) => b.path === rec.relativePath);
+    const deferredItem = pushRes.deferred.find((d) => d.path === rec.relativePath);
+    if (blockedItem) {
+      io.err(`已登记「${rec.relativePath}」，但推送被安全校验拦截：${blockedItem.reason}`);
+      return 1;
+    }
+    if (deferredItem) {
+      io.out(`已登记「${rec.relativePath}」，文件正在写入已延后推送（${deferredItem.reason}）。`);
+      return 0;
+    }
+    controller._lastBackupAt = Date.now();
+    await controller.updateHeartbeat({ status: 'active' });
+    io.out(`已将「${rec.relativePath}」手动纳管（工作区 ${matched.mapping.id}）并立即推送至防灾金库。`);
+  } else {
+    io.out(`已将「${rec.relativePath}」登记进本地产出账本（尚未配置金库）。`);
+  }
+  return 0;
+}
+
+async function runConfig(args, dshHome, io) {
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+
+  const res = await controller.handleConfig({ argsText: args.join(' ') });
+  if (res.kind === 'error') {
+    io.err(`错误：${res.text}`);
+    return 1;
+  }
+  io.out(res.text);
+  return 0;
+}
+
+async function checkProfilePluginRegistered(dshHome, profileName) {
+  const profileDir = path.join(dshHome, 'profiles', profileName);
+  const pkgPath = path.join(profileDir, 'package.json');
+  try {
+    const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
+    const inDeps = Boolean(pkg?.dependencies?.['dsh-soul-sync']);
+    const inBundles = Array.isArray(pkg?.dsh?.profile?.bundles)
+      && pkg.dsh.profile.bundles.includes('dsh-soul-sync');
+    if (inDeps || inBundles) {
+      return { registered: true, source: 'package.json' };
+    }
+  } catch {
+    // Fall through to cordis.patch.yml check
+  }
+
+  for (const fileName of ['cordis.patch.yml', 'cordis.yml']) {
+    try {
+      const text = await fs.readFile(path.join(profileDir, fileName), 'utf8');
+      if (text.includes('dsh-soul-sync')) {
+        return { registered: true, source: fileName };
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return { registered: false, source: null };
+}
+
+async function runDoctor(dshHome, io) {
+  let criticalFailures = 0;
+  const pass = (label, detail) => io.out(`[OK]   ${label}: ${detail}`);
+  const warn = (label, detail) => io.out(`[WARN] ${label}: ${detail}`);
+  const fail = (label, detail) => {
+    criticalFailures += 1;
+    io.out(`[FAIL] ${label}: ${detail}`);
+  };
+
+  io.out(`=== dsh-soul doctor (${dshHome}) ===`);
+
+  // 1. config.json
+  const configPath = path.join(soulSyncDir(dshHome), 'config.json');
+  let config = null;
+  if (!(await pathExists(configPath))) {
+    fail('config.json', `缺失配置文件 ${configPath}（请运行 dsh-soul init）`);
+  } else {
+    try {
+      config = await loadConfig(dshHome);
+      pass('config.json', `已加载 (deviceLabel=${config.deviceLabel})`);
+    } catch (err) {
+      fail('config.json', `解析失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // 2. Vault readability & writability
+  if (!config?.vaultDir) {
+    fail('vaultDir', '未配置防灾金库路径');
+  } else if (!(await pathExists(config.vaultDir))) {
+    fail('vaultDir', `目录不存在: ${config.vaultDir}`);
+  } else {
+    const probeFile = path.join(config.vaultDir, `.doctor-probe-${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`);
+    try {
+      await fs.writeFile(probeFile, 'ok', 'utf8');
+      await fs.rm(probeFile, { force: true });
+      pass('vaultDir', `可正常读写 (${config.vaultDir})`);
+    } catch (err) {
+      fail('vaultDir', `目录不可写 (${config.vaultDir}): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // 3. Encryption key completeness
+  if (config) {
+    if (config.encryptionEnabled) {
+      try {
+        const key = await loadPassphraseKey(dshHome);
+        if (key && key.encKey.length === 32 && key.hmacKey.length === 32) {
+          pass('encryption', '已开启 AES-256-GCM 且本机 secret.key 完整');
+        } else {
+          fail('encryption', '已开启加密但缺少本机 secret.key，请重新运行 dsh-soul init --passphrase');
+        }
+      } catch (err) {
+        fail('encryption', `secret.key 损坏: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      pass('encryption', '明文模式（未开启加密）');
+    }
+  }
+
+  // 4. skills/soul-handoff/SKILL.md
+  const skillPath = path.join(dshHome, 'skills', 'soul-handoff', 'SKILL.md');
+  if (await pathExists(skillPath)) {
+    const skillText = await fs.readFile(skillPath, 'utf8');
+    if (skillText.includes('name: soul-handoff')) {
+      pass('soul-handoff skill', `已就绪 (${skillPath})`);
+    } else {
+      fail('soul-handoff skill', `文件缺少 name: soul-handoff frontmatter (${skillPath})`);
+    }
+  } else {
+    fail('soul-handoff skill', `缺失技能文件 ${skillPath}`);
+  }
+
+  // 5. Global AGENTS.md rules block
+  const agentsPath = path.join(dshHome, 'AGENTS.md');
+  if (await pathExists(agentsPath)) {
+    const agentsText = await fs.readFile(agentsPath, 'utf8');
+    if (agentsText.includes(GLOBAL_AGENTS_RULES_MARKER)) {
+      pass('AGENTS.md', '包含跨平台工作流规范规则块');
+    } else {
+      fail('AGENTS.md', `缺少规则块标记 ${GLOBAL_AGENTS_RULES_MARKER}`);
+    }
+  } else {
+    fail('AGENTS.md', `缺失全局规则文件 ${agentsPath}`);
+  }
+
+  // 6. DSH profiles plugin registration (web & desktop)
+  const webReg = await checkProfilePluginRegistered(dshHome, 'web');
+  const desktopReg = await checkProfilePluginRegistered(dshHome, 'desktop');
+  if (webReg.registered) {
+    pass('profile/web', `dsh-soul-sync 已注册 (${webReg.source})`);
+  } else {
+    warn('profile/web', '未检测到 dsh-soul-sync 插件注册');
+  }
+  if (desktopReg.registered) {
+    pass('profile/desktop', `dsh-soul-sync 已注册 (${desktopReg.source})`);
+  } else {
+    warn('profile/desktop', '未检测到 dsh-soul-sync 插件注册');
+  }
+  if (!webReg.registered && !desktopReg.registered) {
+    fail('profiles', 'web 与 desktop profile 均未注册 dsh-soul-sync 插件（请运行一键安装脚本）');
+  }
+
+  // 7. Workspace mappings & Office locks
+  const mappings = config?.workspaceMappings ?? [];
+  if (mappings.length === 0) {
+    warn('workspaces', '尚未配置跨设备工作区映射');
+  } else {
+    for (const m of mappings) {
+      const localRoot = m[io.platform];
+      if (!localRoot) {
+        warn(`workspace[${m.id}]`, `当前系统 (${io.platform}) 未配置本地路径`);
+        continue;
+      }
+      if (!(await pathExists(localRoot))) {
+        warn(`workspace[${m.id}]`, `本地目录尚不存在: ${localRoot}`);
+        continue;
+      }
+      const wsState = await loadWorkspaceDeliverableState(dshHome, m.id);
+      const locks = await detectOpenOfficeLocks(localRoot, Object.keys(wsState.trackedPaths ?? {}));
+      if (locks.length > 0) {
+        warn(`workspace[${m.id}]`, `目录存在，但检测到未关闭的 Office 锁：${locks.map((l) => l.lockPath).join(', ')}`);
+      } else {
+        pass(`workspace[${m.id}]`, `目录可访问且无 Office 占锁 (${localRoot})`);
+      }
+    }
+  }
+
+  if (criticalFailures > 0) {
+    io.out(`\n体检未通过：发现 ${criticalFailures} 项关键问题。`);
+    return 1;
+  }
+  io.out('\n体检通过：全部核心组件运行健康！');
+  return 0;
+}
+
+async function runWatch(flags, dshHome, io) {
+  const intervalMs = flags.intervalMs !== null
+    ? Math.max(50, Math.round(parsePositiveNumber(flags.intervalMs, '--interval-ms')))
+    : 60000;
+
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 1500,
+  });
+  await controller.reloadConfig();
+  if (!controller.vault) {
+    io.err('错误：尚未配置防灾金库或缺少加密密钥，无法启动 watch。');
+    return 1;
+  }
+
+  const watchers = [];
+  for (const mapping of controller.config.workspaceMappings ?? []) {
+    const localRoot = mapping[io.platform];
+    if (!localRoot || !(await pathExists(localRoot))) continue;
+    try {
+      const handle = createActiveWorkspaceWatcher(localRoot, async (relPosix) => {
+        await recordDeliverableCandidate(dshHome, mapping.id, localRoot, relPosix, 'watcher').catch(() => {});
+      });
+      watchers.push(handle);
+    } catch {
+      // Ignore individual watcher startup error
+    }
+  }
+
+  io.out(`已启动 dsh-soul watch 守护模式（周期 ${intervalMs}ms，监听工作区 ${watchers.length} 个）...`);
+
+  let stopped = false;
+  let runningTick = false;
+
+  const runTick = async () => {
+    if (stopped || runningTick) return;
+    runningTick = true;
+    try {
+      await controller.pushAll();
+    } catch (err) {
+      io.err(`[watch] 同步周期出错: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      runningTick = false;
+    }
+  };
+
+  await runTick();
+
+  await new Promise((resolve) => {
+    const timer = setInterval(() => {
+      void runTick();
+    }, intervalMs);
+
+    const shutdown = () => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      process.off('SIGINT', shutdown);
+      process.off('SIGTERM', shutdown);
+      if (io.signal) {
+        io.signal.removeEventListener('abort', shutdown);
+      }
+      resolve();
+    };
+
+    if (io.signal?.aborted) {
+      shutdown();
+      return;
+    }
+    if (io.signal) {
+      io.signal.addEventListener('abort', shutdown, { once: true });
+    }
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+  });
+
+  await Promise.allSettled(watchers.map((w) => w.close()));
+  await controller.dispose();
+  io.out('dsh-soul watch 已优雅退出。');
+  return 0;
+}
+
+export async function runCli(argv = [], ioOverrides = {}) {
+  const io = makeIo(ioOverrides);
+  let parsed;
+  try {
+    parsed = parseArgv(argv);
+  } catch (err) {
+    io.err(`参数错误：${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+
+  const { flags, positionals } = parsed;
+
+  if (flags.version) {
+    io.out(`dsh-soul ${await readPackageVersion()}`);
+    return 0;
+  }
+
+  const subcommand = positionals[0];
+  if (flags.help || !subcommand || subcommand === 'help') {
+    io.out(formatHelpText());
+    return 0;
+  }
+
+  const dshHome = resolveDshHome(flags.dshHome ?? io.env?.DSH_HOME);
+  const subArgs = positionals.slice(1);
+
+  try {
+    switch (subcommand) {
+      case 'init':
+        return await runInit(flags, dshHome, io);
+      case 'status':
+        return await runStatus(dshHome, io);
+      case 'push':
+        return await runPush(flags, dshHome, io);
+      case 'pull':
+        return await runPull(flags, dshHome, io);
+      case 'keep':
+        return await runKeep(flags, subArgs, dshHome, io);
+      case 'config':
+        return await runConfig(subArgs, dshHome, io);
+      case 'doctor':
+        return await runDoctor(dshHome, io);
+      case 'watch':
+        return await runWatch(flags, dshHome, io);
+      default:
+        io.err(`未知子命令：${subcommand}\n\n${formatHelpText()}`);
+        return 1;
+    }
+  } catch (err) {
+    io.err(`执行失败：${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    const selfPath = fsSync.realpathSync(__filename);
+    const argPath = fsSync.realpathSync(path.resolve(process.argv[1]));
+    if (process.platform === 'win32') {
+      return selfPath.toLowerCase() === argPath.toLowerCase();
+    }
+    return selfPath === argPath;
+  } catch {
+    return path.resolve(process.argv[1]) === __filename;
+  }
+}
+
+if (isMainModule()) {
+  const code = await runCli(process.argv.slice(2));
+  process.exitCode = code;
+}
