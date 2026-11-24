@@ -187,6 +187,8 @@ run_dsh_plugin_add() {
   if [ "$status" -ne 0 ]; then
     if echo "$output" | grep -Eqi "already[[:space:]]+(installed|exists|added)"; then
       echo "  [已安装] profile $profile 已包含 dsh-soul-sync，幂等跳过。"
+    elif [ "$profile" = "desktop" ] && echo "$output" | grep -Eqi "initialize its profile"; then
+      echo "  [提示] 尚未首次启动过 DeepSeek Harness 桌面端，已先完成 web 配置注册；首次打开并退出桌面端后重跑本脚本即可挂载 desktop。"
     else
       echo "向 profile $profile 安装插件失败，退出码: $status" >&2
       return "$status"

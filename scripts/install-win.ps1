@@ -233,6 +233,8 @@ try {
             $combined = ($res.StdOut + "`n" + $res.StdErr)
             if ($combined -match "already\s+(installed|exists|added)") {
                 Write-Host (Msg "  [\u5df2\u5b89\u88c5] profile $profile \u5df2\u5305\u542b dsh-soul-sync\uff0c\u5e42\u7b49\u8df3\u8fc7\u3002")
+            } elseif ($profile -eq "desktop" -and $combined -match "initialize its profile") {
+                Write-Host (Msg "  [\u63d0\u793a] \u5c1a\u672a\u9996\u6b21\u542f\u52a8\u8fc7 DeepSeek Harness \u684c\u9762\u7aef\uff0c\u5df2\u5148\u5b8c\u6210 web \u914d\u7f6e\u6ce8\u518c\uff1b\u9996\u6b21\u6253\u5f00\u5e76\u9000\u51fa\u684c\u9762\u7aef\u540e\u91cd\u8dd1\u672c\u811a\u672c\u5373\u53ef\u6302\u8f7d desktop\u3002") -ForegroundColor Yellow
             } else {
                 Write-Error (Msg "\u5411 profile $profile \u5b89\u88c5\u63d2\u4ef6\u5931\u8d25\uff0c\u9000\u51fa\u7801: $($res.ExitCode)")
                 exit $res.ExitCode

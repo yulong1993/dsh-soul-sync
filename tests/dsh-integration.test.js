@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile as execFileCb } from 'node:child_process';
+import { execFile as execFileCb, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
@@ -370,15 +370,70 @@ const LOCAL_DSH_CLI = LOCAL_DSH_DIR
 const HAS_LIVE_DSH = process.platform === 'win32' && fsSync.existsSync(LOCAL_DSH_EXE);
 
 test(
-  'live local DSH 0.2.2-rc.1 sandbox E2E: install-win.ps1 (idempotent x2) + --dump-config + doctor',
+  'live local DSH 0.2.2-rc.1 sandbox E2E: install-win.ps1 (both profiles + idempotent x2) + live Cordis web boot + startup auto-pull',
   { skip: !HAS_LIVE_DSH },
   async () => {
     const sandboxDir = path.join(TEST_TMP_ROOT, `real-dsh-${process.pid}-${Date.now()}`);
     const isolatedDshHome = path.join(sandboxDir, 'dsh-home');
     const isolatedVault = path.join(sandboxDir, 'vault');
+    const macHome = path.join(sandboxDir, 'mac-home');
+    const macSimWs = path.join(sandboxDir, 'mac-sim-ws');
     const winWs = path.join(sandboxDir, 'win-ws');
-    await fs.mkdir(winWs, { recursive: true });
+    await fs.mkdir(path.join(macSimWs, 'outputs'), { recursive: true });
 
+    // Pre-populate encrypted vault from a simulated Mac peer BEFORE Windows DSH even creates winWs!
+    const macInitIo = makeMemoryIo({ platform: 'darwin' });
+    assert.equal(
+      await runCli(
+        [
+          '--dsh-home', macHome,
+          'init',
+          '--non-interactive',
+          '--vault', isolatedVault,
+          '--passphrase', 'real-e2e-secret',
+          '--device-label', '家里MacBook',
+          '--map', `us=${winWs}::${macSimWs}`,
+        ],
+        macInitIo,
+      ),
+      0,
+      macInitIo.getStderr(),
+    );
+
+    const liveSessId = 'session-live-cordis-boot-01';
+    const liveImg = Buffer.from('\x89PNG\r\n\x1a\nlive-chart-IEND', 'binary');
+    await writeLocalSessionWithAttachment(
+      macHome,
+      {
+        version: 4,
+        id: liveSessId,
+        cwd: macSimWs,
+        createdAt: Date.now() - 2000,
+      },
+      [
+        {
+          seq: 0,
+          time: Date.now() - 1500,
+          type: 'user/message',
+          surfaceOp: 'append',
+          data: {
+            id: 'msg-user-1',
+            role: 'user',
+            content: [{ type: 'text', text: '我们在 Mac 上算完毛利率了，回公司 Windows 继续' }],
+            source: { kind: 'user' },
+          },
+        },
+      ],
+      'margin.png',
+      liveImg,
+    );
+    const liveXlsx = createValidMinimalXlsx('mac-to-live-win-dsh');
+    await fs.writeFile(path.join(macSimWs, 'outputs', 'valuation.xlsx'), liveXlsx);
+
+    const macPushIo = makeMemoryIo({ platform: 'darwin' });
+    assert.equal(await runCli(['--dsh-home', macHome, 'push'], macPushIo), 0, macPushIo.getStderr());
+
+    // Note: NO -SkipDesktop! Verifies uninitialized desktop profile is handled gracefully with exit code 0!
     const installScript = path.join(REPO_ROOT, 'scripts', 'install-win.ps1');
     const installArgs = [
       '-NoProfile',
@@ -388,12 +443,11 @@ test(
       '-DshHome', isolatedDshHome,
       '-VaultDir', isolatedVault,
       '-Passphrase', 'real-e2e-secret',
-      '-Map', `us=${winWs}::/Users/mac/us`,
-      '-SkipDesktop',
+      '-Map', `us=${winWs}::${macSimWs}`,
     ];
 
     try {
-      // Run 1: clean installation into completely isolated DSH_HOME
+      // Run 1: clean installation into completely isolated DSH_HOME (both web & uninitialized desktop)
       const run1 = await execFile('powershell.exe', installArgs, {
         cwd: REPO_ROOT,
         windowsHide: true,
@@ -409,7 +463,7 @@ test(
       });
       assert.match(run2.stdout, /体检通过/);
 
-      // Run real DSH host CLI `--profile web --dump-config` from isolated sandboxDir (no external .env interference)
+      // Run real DSH host CLI `--profile web --dump-config` from isolated sandboxDir
       const dumpRes = await execFile(
         LOCAL_DSH_EXE,
         ['--expose-internals', LOCAL_DSH_CLI, '--profile', 'web', '--dump-config'],
@@ -430,6 +484,108 @@ test(
         `Expected --dump-config to include "# == dsh-soul-sync", got:\n${dumpRes.stdout.slice(0, 600)}`,
       );
 
+      // ACTUALLY BOOT real DeepSeek Harness `web` profile runtime (`@deepseek-ai/cordis`)
+      // and verify `dsh-soul-sync` activates with ZERO errors and executes live startup auto-pull!
+      const bootResult = await new Promise((resolve, reject) => {
+        const child = spawn(
+          LOCAL_DSH_EXE,
+          ['--expose-internals', LOCAL_DSH_CLI, '--profile', 'web', '--no-open', '--port', '0'],
+          {
+            cwd: sandboxDir,
+            env: {
+              ...process.env,
+              ELECTRON_RUN_AS_NODE: '1',
+              DSH_HOME: isolatedDshHome,
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+          },
+        );
+
+        let stdout = '';
+        let stderr = '';
+        let settled = false;
+
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          try {
+            child.kill();
+          } catch {
+            // ignore
+          }
+        };
+
+        const timeout = setTimeout(() => {
+          finish();
+          reject(new Error(`Timed out waiting for live dsh web boot.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`));
+        }, 25000);
+
+        child.stdout.on('data', (chunk) => {
+          stdout += chunk.toString('utf8');
+          if (stdout.includes('dsh web: http://127.0.0.1:')) {
+            // Give async controller.start() 1500ms to finish live pullSessionsFromVault + WorkspaceRegistry reconciliation
+            setTimeout(() => {
+              clearTimeout(timeout);
+              finish();
+            }, 1500);
+          }
+        });
+
+        child.stderr.on('data', (chunk) => {
+          stderr += chunk.toString('utf8');
+        });
+
+        child.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+
+        child.on('close', () => {
+          clearTimeout(timeout);
+          resolve({ stdout, stderr });
+        });
+      });
+
+      assert.match(bootResult.stdout, /dsh web: http:\/\/127\.0\.0\.1:\d+/);
+      assert.equal(
+        bootResult.stderr.includes('did not activate'),
+        false,
+        `Real DSH Cordis failed to activate plugin:\n${bootResult.stderr}`,
+      );
+      assert.equal(
+        bootResult.stderr.includes('cannot get property'),
+        false,
+        `Real DSH Cordis strict proxy error:\n${bootResult.stderr}`,
+      );
+
+      assert.equal(
+        bootResult.stderr.includes('[dsh-soul-sync] startup error:'),
+        false,
+        `Startup error inside live DSH:\n${bootResult.stderr}`,
+      );
+
+      // Verify live DSH boot auto-created winWs, decrypted & restored valuation.xlsx, imported V4 session, and reconciled WorkspaceRegistry!
+      const restoredXlsx = await fs.readFile(path.join(winWs, 'outputs', 'valuation.xlsx'));
+      assert.ok(restoredXlsx.equals(liveXlsx), 'Live DSH boot should auto-pull encrypted deliverables into winWs');
+
+      const winSessPath = path.join(
+        isolatedDshHome,
+        'sessions',
+        projectKey(winWs),
+        encodeSegment(liveSessId),
+        'session.v4.jsonl.zstd',
+      );
+      const winDecoded = await decodeV4SessionLog(await fs.readFile(winSessPath));
+      assert.equal(winDecoded.header.cwd.toLowerCase(), winWs.toLowerCase());
+
+      const wsJson = JSON.parse(await fs.readFile(path.join(isolatedDshHome, 'storages', 'workspace.json'), 'utf8'));
+      const wsEntries = Object.values(wsJson.tables?.workspaces ?? {});
+      assert.ok(
+        wsEntries.some((w) => Array.isArray(w.sessionIds) && w.sessionIds.includes(liveSessId)),
+        `Expected real DSH WorkspaceRegistry to attach ${liveSessId}, got: ${JSON.stringify(wsJson)}`,
+      );
+
       // Run standalone `node bin/dsh-soul.js --dsh-home <isolatedDshHome> doctor`
       const doctorRes = await execFile(
         process.execPath,
@@ -442,6 +598,75 @@ test(
       );
       assert.match(doctorRes.stdout, /\[OK\]\s+profile\/web/);
       assert.match(doctorRes.stdout, /体检通过/);
+
+      // Verify real @deepseek-ai/dsh-session-persistence-jsonl opens imported & split-brain forked sessions
+      // AND real @deepseek-ai/dsh-commands executes all 6 `/soul` slash commands inside real Cordis!
+      const verifierScript = path.join(sandboxDir, 'verify-asar-services.mjs');
+      const dshScopeDir = path.join(LOCAL_DSH_DIR, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai');
+      const verifierSource = `
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const scopeDir = ${JSON.stringify(dshScopeDir)};
+const repoRoot = ${JSON.stringify(REPO_ROOT)};
+const isolatedDshHome = ${JSON.stringify(isolatedDshHome)};
+const winWs = ${JSON.stringify(winWs)};
+
+const { Context } = await import(pathToFileURL(path.join(scopeDir, 'cordis', 'lib', 'index.js')).href);
+const PersistenceMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-session-persistence-jsonl', 'lib', 'index.js')).href);
+const CommandsMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-commands', 'lib', 'index.js')).href);
+const SessionMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-session', 'lib', 'index.js')).href);
+const { createScope } = await import(pathToFileURL(path.join(scopeDir, 'dsh-scope', 'lib', 'index.js')).href);
+const SoulSyncPlugin = await import(pathToFileURL(path.join(repoRoot, 'lib', 'index.js')).href);
+
+const ctx = new Context();
+ctx.plugin(SessionMod.default ?? SessionMod);
+ctx.plugin(CommandsMod.default ?? CommandsMod);
+ctx.plugin(PersistenceMod.default ?? PersistenceMod, { root: path.join(isolatedDshHome, 'sessions'), compression: 'zstd' });
+ctx.plugin(SoulSyncPlugin, { dshHome: isolatedDshHome, minQuietMs: 0 });
+await new Promise((r) => setTimeout(r, 250));
+
+// 1. Real JsonlSessionPersistence.open('read') decodes the imported session without V4 schema/surface errors
+const handle = await ctx.get('sessionPersistence').open(${JSON.stringify(liveSessId)}, 'read');
+const slice = await handle.read();
+assert.equal(slice.events.length, 1);
+assert.equal(slice.events[0].type, 'user/message');
+await handle.close();
+
+// 2. Real CommandRuntime.execute runs all 6 /soul subcommands and appends command/run + command/done events
+const liveSession = ctx.get('sessions').create('live-cmd-sess', {
+  meta: { version: 4, id: 'live-cmd-sess', createdAt: Date.now(), cwd: winWs, isSeeded: false, delegationDepth: 0 },
+});
+const steered = [];
+const fakeAgent = { id: liveSession.id, session: liveSession, steer: (m) => steered.push(m) };
+fakeAgent.scope = createScope(ctx, fakeAgent);
+fakeAgent.ctx = fakeAgent.scope.ctx;
+
+await fs.writeFile(path.join(winWs, 'notes.md'), '# 实时验收假设\\n', 'utf8');
+for (const line of ['/soul status', '/soul keep notes.md', '/soul config maxFileMB=48', '/soul handoff 验收通过', '/soul push', '/soul pull']) {
+  const execRes = await ctx.get('commands').execute(fakeAgent, line, [], new AbortController().signal);
+  assert.ok(execRes, 'Command should resolve: ' + line);
+  assert.equal(execRes.result.kind, 'success', line + ' failed: ' + execRes.result.text);
+}
+assert.equal(steered.length, 1);
+assert.equal(liveSession.snapshotEvents().length, 12);
+await ctx.fiber.dispose();
+console.log('ASAR_LIVE_SERVICES_OK');
+`;
+      await fs.writeFile(verifierScript, verifierSource, 'utf8');
+      const liveServicesRes = await execFile(
+        LOCAL_DSH_EXE,
+        ['--expose-internals', verifierScript],
+        {
+          cwd: sandboxDir,
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+          windowsHide: true,
+          timeout: 20000,
+        },
+      );
+      assert.match(liveServicesRes.stdout, /ASAR_LIVE_SERVICES_OK/);
     } finally {
       await fs.rm(sandboxDir, { recursive: true, force: true });
     }
