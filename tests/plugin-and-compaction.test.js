@@ -125,7 +125,7 @@ async function writeLocalSession(dshHome, header, events, version = header.versi
 }
 
 test.after(async () => {
-  await fs.rm(TEST_TMP_ROOT, { recursive: true, force: true });
+  await fs.rm(TEST_TMP_ROOT, { recursive: true, force: true, maxRetries: 6, retryDelay: 100 });
 });
 
 test('compaction-soul: instruction contract, KV-cache prefix preservation, and llm/stream waterfall interception', async () => {
@@ -140,11 +140,12 @@ test('compaction-soul: instruction contract, KV-cache prefix preservation, and l
     cursor = idx;
   }
 
-  // First-person native-language + Flash -> V4Pro visual bridge + DSH safety rules
+  // First-person native-language + Flash -> V4Pro visual bridge + scope isolation + DSH safety rules
   assert.match(SOUL_COMPACTION_INSTRUCTION, /第一人称/);
   assert.match(SOUL_COMPACTION_INSTRUCTION, /deepseek-v4-pro/i);
   assert.match(SOUL_COMPACTION_INSTRUCTION, /<compacted-summary>/);
   assert.match(SOUL_COMPACTION_INSTRUCTION, /\(无\)/);
+  assert.match(SOUL_COMPACTION_INSTRUCTION, /议题作用域隔离/);
 
   // rewriteCompactionStreamOptions replaces ONLY last user message and keeps prefix references identical
   const sysMsg = { role: 'system', content: 'You are DSH.' };
@@ -874,8 +875,13 @@ test('nl-router & /soul natural-language routing: all Tier-1 direct intents and 
   });
 
   // Must NOT misclassify generic sync progress without file path as `keep`
-  const progressSync = parseNaturalSoulIntent('帮我把最新进度同步一下');
-  assert.notEqual(progressSync.kind, 'keep');
+  assert.equal(parseNaturalSoulIntent('帮我把最新进度同步一下').kind, 'sync');
+  assert.equal(parseNaturalSoulIntent('同步').kind, 'sync');
+  assert.equal(parseNaturalSoulIntent('同步一下').kind, 'sync');
+  assert.equal(parseNaturalSoulIntent('接力').kind, 'sync');
+  assert.equal(parseNaturalSoulIntent('恢复').kind, 'sync');
+  assert.equal(parseNaturalSoulIntent('刷新').kind, 'sync');
+  assert.equal(parseNaturalSoulIntent('sync').kind, 'sync');
 
   assert.equal(parseNaturalSoulIntent('把家里Mac改过的东西拉下来').kind, 'pull');
   assert.equal(parseNaturalSoulIntent('我把Excel关了帮我把暂存文件落位').kind, 'pull');
@@ -885,10 +891,10 @@ test('nl-router & /soul natural-language routing: all Tier-1 direct intents and 
   assert.equal(parseNaturalSoulIntent('怎么用').kind, 'help');
   assert.equal(parseNaturalSoulIntent('help').kind, 'help');
 
-  // Tier-2 complex / open-ended requests -> agent-assist (NEVER unknown subcommand error)
-  assert.equal(parseNaturalSoulIntent('帮我对比一下冲突副本和现在的估值表差在哪并合并').kind, 'agent-assist');
-  assert.equal(parseNaturalSoulIntent('帮我看看今天新建的几个脚本哪些还没进同步账本，挑重要的同步上去').kind, 'agent-assist');
-  assert.equal(parseNaturalSoulIntent('帮我排查一下为什么刚才有个文件被拦截了').kind, 'agent-assist');
+  // Unrecognized / complex requests MUST NOT hijack active AI session -> instant `help-with-status`
+  assert.equal(parseNaturalSoulIntent('帮我对比一下冲突副本和现在的估值表差在哪并合并').kind, 'help-with-status');
+  assert.equal(parseNaturalSoulIntent('帮我看看今天新建的几个脚本哪些还没进同步账本，挑重要的同步上去').kind, 'help-with-status');
+  assert.equal(parseNaturalSoulIntent('帮我排查一下为什么刚才有个文件被拦截了').kind, 'help-with-status');
 
   // End-to-end execution through SoulSyncController /soul command
   const caseDir = path.join(TEST_TMP_ROOT, 'nl-e2e');
@@ -911,7 +917,7 @@ test('nl-router & /soul natural-language routing: all Tier-1 direct intents and 
   });
 
   const ctx = createMockCordisCtx();
-  const controller = await applySoulSyncPlugin(ctx, { dshHome, platform: 'win32', minQuietMs: 0 });
+  const controller = await applySoulSyncPlugin(ctx, { dshHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
   await controller.readyPromise;
   const soulCmd = ctx.commands.get('soul');
 
@@ -963,7 +969,7 @@ test('nl-router & /soul natural-language routing: all Tier-1 direct intents and 
   const wsState = await loadWorkspaceDeliverableState(dshHome, 'ws-nl');
   assert.equal(wsState.trackedPaths['notes/核心假设.md']?.source, 'manual');
 
-  // 5) NL push & pull
+  // 5) NL push, pull, and deterministic bidirectional sync
   const nlPush = await soulCmd.handler({ agent: mockAgent, rawInput: '帮我把现在的进度马上备份一下' });
   assert.equal(nlPush.kind, 'success');
   assert.ok(nlPush.text.includes('推送完成'));
@@ -971,6 +977,10 @@ test('nl-router & /soul natural-language routing: all Tier-1 direct intents and 
   const nlPull = await soulCmd.handler({ agent: mockAgent, rawInput: '把家里Mac改过的东西拉下来' });
   assert.equal(nlPull.kind, 'success');
   assert.ok(nlPull.text.includes('拉取完成'));
+
+  const nlSync = await soulCmd.handler({ agent: mockAgent, rawInput: '同步一下' });
+  assert.equal(nlSync.kind, 'success');
+  assert.ok(nlSync.text.includes('双向同步完成'));
 
   // 6) NL handoff -> triggers agent.steer with handoff diary prompt
   const nlHandoff = await soulCmd.handler({ agent: mockAgent, rawInput: '我准备下班回家用Mac继续算毛利率了' });
@@ -984,27 +994,125 @@ test('nl-router & /soul natural-language routing: all Tier-1 direct intents and 
   assert.equal(nlHelp.kind, 'success');
   assert.ok(nlHelp.text.includes('/soul'));
 
-  // 8) Tier-2 complex open-ended request -> delegates via agent.steer with structured Soul Sync context (NEVER returns error!)
-  const nlComplex = await soulCmd.handler({
+  // 8) Unrecognized / complex request -> instant cheat-sheet + status card, ZERO steer/LLM hijacking!
+  const nlUnrecognized = await soulCmd.handler({
     agent: mockAgent,
     rawInput: '帮我对比一下冲突副本和现在的估值表差在哪并合并',
   });
-  assert.equal(nlComplex.kind, 'success');
-  assert.ok(nlComplex.text.includes('已收到你的自然语言指令'));
-  assert.equal(steered.length, 2);
-  const assistText = steered[1].content[0].text;
-  assert.ok(assistText.includes('[Soul Sync 自然语言协同请求]'));
-  assert.ok(assistText.includes('帮我对比一下冲突副本和现在的估值表差在哪并合并'));
-  assert.ok(assistText.includes('双机接力体检卡'));
-  assert.ok(assistText.includes('dsh-soul.js'));
+  assert.equal(nlUnrecognized.kind, 'success');
+  assert.ok(nlUnrecognized.text.includes('Soul Sync 速查指南'));
+  assert.ok(nlUnrecognized.text.includes('双机接力体检卡'));
+  assert.equal(steered.length, 1, 'Unrecognized /soul input must NEVER hijack AI via agent.steer');
 
-  // 9) Tier-2 fallback when no steer/followup/inbox route exists -> still returns kind: 'success' with status card
-  const nlComplexOffline = await soulCmd.handler({
+  // 9) Offline unrecognized request also returns instant cheat-sheet + status card
+  const nlUnrecognizedOffline = await soulCmd.handler({
     agent: null,
     rawInput: '帮我排查一下为什么刚才有个文件被拦截了',
   });
-  assert.equal(nlComplexOffline.kind, 'success');
-  assert.ok(nlComplexOffline.text.includes('双机接力体检卡'));
+  assert.equal(nlUnrecognizedOffline.kind, 'success');
+  assert.ok(nlUnrecognizedOffline.text.includes('双机接力体检卡'));
+
+  await ctx.disposeAll();
+});
+
+test('background 15s poller auto-pulls new peer commits silently & volatile Settings UI sync persists config.json + secret.key + heartbeat lastBackupAt', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'poller-and-settings');
+  const winHome = path.join(caseDir, 'win-home');
+  const macHome = path.join(caseDir, 'mac-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const winWs = path.join(caseDir, 'win-ws');
+  const macWs = path.join(caseDir, 'mac-ws');
+  await fs.mkdir(winWs, { recursive: true });
+  await fs.mkdir(macWs, { recursive: true });
+  await fs.mkdir(vaultDir, { recursive: true });
+
+  // Simulate volatile refs like Cordis passes from Schemastery `.volatile()` fields
+  const makeVolatile = (initial) => {
+    let val = initial;
+    return {
+      get: () => val,
+      set: (next) => { val = next; },
+    };
+  };
+
+  const vVault = makeVolatile('');
+  const vPass = makeVolatile('');
+  const vStepSync = makeVolatile(true);
+  const vLabel = makeVolatile('');
+
+  const ctx = createMockCordisCtx();
+  const controller = await applySoulSyncPlugin(ctx, {
+    dshHome: winHome,
+    platform: 'win32',
+    minQuietMs: 0,
+    pollIntervalMs: 60,
+    vaultDir: vVault,
+    passphrase: vPass,
+    stepSyncEnabled: vStepSync,
+    deviceLabel: vLabel,
+  });
+  await controller.readyPromise;
+  assert.equal(controller.vault, null, 'Vault is null before user configures Settings UI');
+
+  // Simulate user filling in DSH Settings -> Plugins -> Soul Sync form!
+  vVault.set(vaultDir);
+  vPass.set('ui-settings-secret-2026');
+  vStepSync.set(false);
+  vLabel.set('图形设置Win');
+  await ctx.emit('settings/document-updated', 'dsh-soul-sync');
+  // Wait briefly for async syncVolatileSettings
+  await new Promise((r) => setTimeout(r, 120));
+
+  const savedCfg = await loadConfig(winHome);
+  assert.equal(savedCfg.vaultDir, path.resolve(vaultDir));
+  assert.equal(savedCfg.encryptionEnabled, true);
+  assert.equal(savedCfg.stepSyncEnabled, false);
+  assert.equal(savedCfg.deviceLabel, '图形设置Win');
+  assert.ok(controller.vault?.encrypted, 'Controller vault should hot-reload in encrypted mode');
+
+  // Now simulate Mac peer publishing a brand-new encrypted session into vaultDir while Win DSH is idling
+  const macKeys = await savePassphraseKey(macHome, 'ui-settings-secret-2026');
+  const macVault = new VaultStore({ vaultDir, deviceId: 'mac-poller-peer', platform: 'darwin', secretKeys: macKeys });
+  const peerSid = 'sess-bg-polled-01';
+  await writeLocalSession(
+    macHome,
+    { type: 'session', version: 4, id: peerSid, createdAt: Date.now(), cwd: macWs, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: Date.now(), type: 'user/message', data: { content: [{ type: 'text', text: '后台15秒无感拉取测试' }] } }],
+  );
+  await exportSessionClosure({
+    dshHome: macHome,
+    vault: macVault,
+    sessionId: peerSid,
+    workspaceMappings: [{ id: 'w-poll', title: 'Poll', win32: winWs, darwin: macWs }],
+  });
+
+  // Add workspace mapping so polled session lands cleanly in winWs, then wait for background poll tick!
+  await saveConfig(winHome, {
+    workspaceMappings: [{ id: 'w-poll', title: 'Poll', win32: winWs, darwin: macWs }],
+  });
+  await controller.reloadConfig();
+
+  const deadline = Date.now() + 2000;
+  let pulledPath = null;
+  while (Date.now() < deadline) {
+    const cand = path.join(winHome, 'sessions', projectKey(winWs), encodeSegment(peerSid), 'session.v4.jsonl.zstd');
+    try {
+      await fs.stat(cand);
+      pulledPath = cand;
+      break;
+    } catch {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+  }
+  assert.ok(pulledPath, 'Background poller should automatically pull newly arrived peer commit without any command');
+
+  // Verify reloadConfig restores _lastBackupAt from local device heartbeat.json on fresh restart
+  const priorBackupTs = Date.now() - 45000;
+  await controller.vault.writeHeartbeat({ deviceLabel: '图形设置Win', lastBackupAt: priorBackupTs });
+  const freshCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', pollIntervalMs: 0 });
+  await freshCtrl.reloadConfig();
+  assert.equal(freshCtrl._lastBackupAt, priorBackupTs);
+  await freshCtrl.dispose();
 
   await ctx.disposeAll();
 });

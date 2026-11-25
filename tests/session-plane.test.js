@@ -982,4 +982,228 @@ test.describe('session-plane: true split-brain zero-shift fork & safety guards',
     const busyRes = pullBatch.results.find((r) => r.sessionId === busySid);
     assert.equal(busyRes?.status, 'deferred-busy');
   });
+
+  test('zero-config auto-homing into default workspace + pin-to-top + vault self-rescue + basename match + orphan migration + Win->Mac->Win roundtrip + unmapped outputs/', async () => {
+    const winHome = path.join(TEST_TMP_ROOT, 'ux1-win-home');
+    const macHome = path.join(TEST_TMP_ROOT, 'ux1-mac-home');
+    const vaultDir = path.join(TEST_TMP_ROOT, 'ux1-vault');
+    const winRandomDir = path.join(TEST_TMP_ROOT, 'ux1-win-any-folder');
+    const macDefaultWsDir = path.join(TEST_TMP_ROOT, 'ux1-mac-default-workspace');
+    const macSameNameDir = path.join(TEST_TMP_ROOT, 'ux1-mac-parent', 'same-name-proj');
+    const winSameNameDir = path.join(TEST_TMP_ROOT, 'ux1-win-parent', 'same-name-proj');
+
+    await fs.mkdir(path.join(winRandomDir, 'outputs'), { recursive: true });
+    await fs.mkdir(macDefaultWsDir, { recursive: true });
+    await fs.mkdir(macSameNameDir, { recursive: true });
+    await fs.mkdir(winSameNameDir, { recursive: true });
+    await fs.mkdir(vaultDir, { recursive: true });
+
+    const winVault = new VaultStore({ vaultDir, deviceId: 'win-zero-cfg', platform: 'win32' });
+    const macVault = new VaultStore({ vaultDir, deviceId: 'mac-zero-cfg', platform: 'darwin' });
+
+    // Create a mock Mac workspaceRegistry with defaultWorkspaceId + an existing session + a same-basename workspace
+    const defaultWsRecord = {
+      id: 'ws-default',
+      path: macDefaultWsDir,
+      sessionIds: ['session-older-001'],
+      insertCalls: [],
+      async attachSession(id) {
+        if (!this.sessionIds.includes(id)) this.sessionIds.push(id);
+      },
+      async insertSessionBefore(id, beforeId) {
+        this.insertCalls.push({ id, beforeId });
+        const without = this.sessionIds.filter((s) => s !== id);
+        const idx = without.indexOf(beforeId);
+        this.sessionIds = idx === -1 ? [id, ...without] : [...without.slice(0, idx), id, ...without.slice(idx)];
+      },
+      async detachSession(id) {
+        this.sessionIds = this.sessionIds.filter((s) => s !== id);
+      },
+    };
+    const sameNameWsRecord = {
+      id: 'ws-same-name',
+      path: macSameNameDir,
+      sessionIds: [],
+      async attachSession(id) {
+        if (!this.sessionIds.includes(id)) this.sessionIds.unshift(id);
+      },
+      async insertSessionBefore() {},
+      async detachSession(id) {
+        this.sessionIds = this.sessionIds.filter((s) => s !== id);
+      },
+    };
+    const unmappedWsPath = path.join(macHome, 'soul-sync', 'unmapped-workspaces', 'D', 'legacy');
+    const oldUnmappedWsRecord = {
+      id: 'ws-old-unmapped',
+      path: unmappedWsPath,
+      sessionIds: ['session-orphan-01'],
+      detached: [],
+      async attachSession() {},
+      async detachSession(id) {
+        this.detached.push(id);
+        this.sessionIds = this.sessionIds.filter((s) => s !== id);
+      },
+    };
+
+    const macCordisCtx = {
+      workspaceRegistry: {
+        state: { defaultWorkspaceId: 'ws-default' },
+        get(id) {
+          if (id === 'ws-default') return defaultWsRecord;
+          if (id === 'ws-same-name') return sameNameWsRecord;
+          if (id === 'ws-old-unmapped') return oldUnmappedWsRecord;
+          return undefined;
+        },
+        list() {
+          return [defaultWsRecord, sameNameWsRecord, oldUnmappedWsRecord];
+        },
+        async create(cwd) {
+          if (cwd.toLowerCase() === macDefaultWsDir.toLowerCase()) return defaultWsRecord;
+          if (cwd.toLowerCase() === macSameNameDir.toLowerCase()) return sameNameWsRecord;
+          return { id: 'ws-other', path: cwd, sessionIds: [], async attachSession() {} };
+        },
+      },
+      storageDomain: {
+        get() { return { table() { return { async delete() {} }; } }; },
+      },
+    };
+
+    // 1. Unmapped Win session with outputs/ (valid file + skipped ~$ lock + skipped .env + skipped sk- secret)
+    const relaySid = 'session-zero-cfg-relay';
+    const winEvents1 = [
+      { seq: 0, time: 1000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '分析行业格局' }] } },
+      { seq: 1, time: 1001, type: 'working-directory/change', data: { cwd: path.join(winRandomDir, 'outputs') } },
+      { seq: 2, time: 1002, type: 'deliverables/presented', data: { files: [{ path: path.join(winRandomDir, 'outputs', 'report.md') }] } },
+      { seq: 3, time: 1003, type: 'assistant/message', data: { stream: [{ type: 'text', text: '已生成 outputs/report.md' }] } },
+    ];
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: relaySid, createdAt: 1000, cwd: winRandomDir, isSeeded: false, delegationDepth: 0 },
+      winEvents1,
+    );
+    await fs.writeFile(path.join(winRandomDir, 'outputs', 'report.md'), '# 行业格局报告 v1\n', 'utf8');
+    await fs.writeFile(path.join(winRandomDir, 'outputs', '~$report.xlsx'), 'excel-lock', 'utf8');
+    await fs.writeFile(path.join(winRandomDir, 'outputs', '.env'), 'SECRET=123\n', 'utf8');
+    await fs.writeFile(path.join(winRandomDir, 'outputs', 'leaked.txt'), 'token=sk-1234567890abcdefghij\n', 'utf8');
+
+    // 2. Vault self-rescue session: user mistakenly opened vaultDir itself as workspace on Win!
+    const vaultOopsSid = 'session-opened-in-vault';
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: vaultOopsSid, createdAt: 1010, cwd: vaultDir, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1011, type: 'user/message', data: { content: [{ type: 'text', text: '误在金库目录聊的' }] } }],
+    );
+
+    // 3. Same-basename session (zero workspaceMappings -> auto-matches macSameNameDir!)
+    const basenameSid = 'session-same-basename';
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: basenameSid, createdAt: 1020, cwd: winSameNameDir, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1021, type: 'user/message', data: { content: [{ type: 'text', text: '同名目录自动匹配' }] } }],
+    );
+
+    // 4. Orphan session ALREADY sitting in Mac's unmapped-workspaces with identical events
+    const orphanSid = 'session-orphan-01';
+    const orphanEvents = [
+      { seq: 0, time: 1030, type: 'user/message', data: { content: [{ type: 'text', text: '旧孤儿会话' }] } },
+    ];
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: orphanSid, createdAt: 1030, cwd: winRandomDir, isSeeded: false, delegationDepth: 0 },
+      orphanEvents,
+    );
+    await writeLocalSession(
+      macHome,
+      { type: 'session', version: 4, id: orphanSid, createdAt: 1030, cwd: unmappedWsPath, isSeeded: false, delegationDepth: 0 },
+      orphanEvents,
+    );
+
+    // Export all 4 from Windows with ZERO workspaceMappings!
+    const expRelay = await exportSessionClosure({ dshHome: winHome, vault: winVault, sessionId: relaySid, workspaceMappings: [] });
+    assert.equal(expRelay.packedOutputCount, 1, 'Only safe report.md should be packed (lock/.env/sk- skipped)');
+    await exportSessionClosure({ dshHome: winHome, vault: winVault, sessionId: vaultOopsSid, workspaceMappings: [] });
+    await exportSessionClosure({ dshHome: winHome, vault: winVault, sessionId: basenameSid, workspaceMappings: [] });
+    await exportSessionClosure({ dshHome: winHome, vault: winVault, sessionId: orphanSid, workspaceMappings: [] });
+
+    // Pull on target (using current platform so outputs/ and fs checks execute for real)
+    const macPull = await pullSessionsFromVault({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceMappings: [],
+      targetPlatform: process.platform,
+      cordisCtx: macCordisCtx,
+    });
+    assert.equal(macPull.summary.imported, 3);
+    assert.equal(macPull.summary.migrated, 1);
+    assert.equal(macPull.summary.forkedBranches, 0);
+
+    // Verify relaySid auto-homed into macDefaultWsDir and pinned above session-older-001!
+    assert.ok(defaultWsRecord.sessionIds.includes(relaySid));
+    assert.ok(defaultWsRecord.sessionIds.includes(vaultOopsSid), 'Vault-dir session must be rescued into default workspace');
+    assert.ok(defaultWsRecord.sessionIds.includes(orphanSid), 'Orphan session must be rescued into default workspace');
+    assert.equal(defaultWsRecord.sessionIds[defaultWsRecord.sessionIds.length - 1], 'session-older-001', 'New/migrated sessions must be pinned above older sessions');
+    assert.ok(defaultWsRecord.insertCalls.length >= 1, 'insertSessionBefore should pin relay sessions to top');
+
+    // Verify basenameSid auto-matched same-name-proj!
+    assert.ok(sameNameWsRecord.sessionIds.includes(basenameSid));
+
+    // Verify orphanSid was detached from old unmapped workspace and old projectKey dir was cleaned up!
+    assert.ok(oldUnmappedWsRecord.detached.includes(orphanSid));
+    const orphanDirs = await findAllSessionDirsById(macHome, orphanSid);
+    assert.equal(orphanDirs.length, 1);
+    const orphanDecoded = await decodeV4SessionLog(await fs.readFile(path.join(orphanDirs[0].dir, 'session.v4.jsonl.zstd')));
+    assert.equal(orphanDecoded.header.cwd.toLowerCase(), macDefaultWsDir.toLowerCase());
+
+    // Verify unmapped outputs/ report.md was restored to macDefaultWsDir/outputs/report.md (and secrets were NOT)
+    assert.equal(await fs.readFile(path.join(macDefaultWsDir, 'outputs', 'report.md'), 'utf8'), '# 行业格局报告 v1\n');
+    await assert.rejects(() => fs.stat(path.join(macDefaultWsDir, 'outputs', '.env')), { code: 'ENOENT' });
+    await assert.rejects(() => fs.stat(path.join(macDefaultWsDir, 'outputs', 'leaked.txt')), { code: 'ENOENT' });
+
+    // Verify vaultOopsSid did NOT land inside vaultDir
+    const vaultOopsDirs = await findAllSessionDirsById(macHome, vaultOopsSid);
+    const vaultOopsDecoded = await decodeV4SessionLog(await fs.readFile(path.join(vaultOopsDirs[0].dir, 'session.v4.jsonl.zstd')));
+    assert.equal(vaultOopsDecoded.header.cwd.toLowerCase(), macDefaultWsDir.toLowerCase());
+
+    // 5. Roundtrip: continue chatting 2 turns on Mac (in macDefaultWsDir), export, and pull back to Win (in winRandomDir)!
+    const macRelayDirs = await findAllSessionDirsById(macHome, relaySid);
+    const macRelayPath = path.join(macRelayDirs[0].dir, 'session.v4.jsonl.zstd');
+    const macRelayDecoded = await decodeV4SessionLog(await fs.readFile(macRelayPath));
+    const macContinuedEvents = [
+      ...macRelayDecoded.events,
+      { seq: 4, time: 2000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Mac 续聊第一轮' }] } },
+      { seq: 5, time: 2001, type: 'working-directory/change', data: { cwd: path.join(macDefaultWsDir, 'outputs') } },
+      { seq: 6, time: 2002, type: 'assistant/message', data: { stream: [{ type: 'text', text: 'Mac 续聊结论' }] } },
+    ];
+    await writeFileAtomic(macRelayPath, await encodeV4SessionLog(macRelayDecoded.header, macContinuedEvents), { mode: 0o600 });
+
+    // Also modify outputs/report.md on BOTH sides to test non-destructive conflict copy on Win pull
+    await fs.writeFile(path.join(macDefaultWsDir, 'outputs', 'report.md'), '# 行业格局报告 v2 (Mac)\n', 'utf8');
+    await fs.writeFile(path.join(winRandomDir, 'outputs', 'report.md'), '# 行业格局报告 v2 (Win local edit)\n', 'utf8');
+
+    await exportSessionClosure({ dshHome: macHome, vault: macVault, sessionId: relaySid, workspaceMappings: [], deviceLabel: 'MacBook' });
+
+    const winPullBack = await pullSessionsFromVault({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceMappings: [],
+      targetPlatform: process.platform,
+    });
+    const relayBack = winPullBack.results.find((r) => r.sessionId === relaySid);
+    assert.equal(relayBack?.status, 'fast-forwarded', 'Zero-config Win->Mac->Win roundtrip must Fast-Forward without false split-brain');
+    assert.equal(relayBack?.previousEventCount, 4);
+    assert.equal(relayBack?.newEventCount, 7);
+    assert.equal(winPullBack.summary.forkedBranches, 0);
+
+    // Win session MUST remain in winRandomDir (Priority A), with working-directory/change rewritten back to winRandomDir/outputs!
+    const winAfterDirs = await findAllSessionDirsById(winHome, relaySid);
+    assert.equal(winAfterDirs.length, 1);
+    const winAfterDecoded = await decodeV4SessionLog(await fs.readFile(path.join(winAfterDirs[0].dir, 'session.v4.jsonl.zstd')));
+    assert.equal(winAfterDecoded.header.cwd.toLowerCase(), winRandomDir.toLowerCase());
+    assert.equal(winAfterDecoded.events[5].data.cwd.toLowerCase(), path.join(winRandomDir, 'outputs').toLowerCase());
+
+    // Local Win report.md was preserved untouched AND Mac's conflicting version landed as a sidecar conflict copy!
+    assert.equal(await fs.readFile(path.join(winRandomDir, 'outputs', 'report.md'), 'utf8'), '# 行业格局报告 v2 (Win local edit)\n');
+    assert.equal(relayBack?.outputConflicts?.length, 1);
+    assert.equal(await fs.readFile(relayBack.outputConflicts[0].conflictPath, 'utf8'), '# 行业格局报告 v2 (Mac)\n');
+  });
 });

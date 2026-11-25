@@ -687,9 +687,30 @@ const ToolsMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-tools', 'li
 const TokenMeterMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-token-meter', 'lib', 'index.js')).href);
 const { createUserMessage, createAssistantMessage } = await import(pathToFileURL(path.join(scopeDir, 'dsh-llm', 'lib', 'index.js')).href);
 const { createScope } = await import(pathToFileURL(path.join(scopeDir, 'dsh-scope', 'lib', 'index.js')).href);
+const SettingsSchemaMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-settings', 'lib', 'types', 'schema.js')).href);
+const SettingsRedactMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-settings', 'lib', 'types', 'redact.js')).href);
+const DeepSeekMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-llm-deepseek', 'lib', 'index.js')).href);
 const SoulSyncPlugin = await import(pathToFileURL(path.join(repoRoot, 'lib', 'index.js')).href);
 const { compactSessionPreservingTail } = await import(pathToFileURL(path.join(repoRoot, 'lib', 'tail-compactor.js')).href);
 const { SOUL_COMPACTION_SECTIONS, SOUL_RECALL_HINT_LINE } = await import(pathToFileURL(path.join(repoRoot, 'lib', 'compaction-soul.js')).href);
+
+// 0. Verify real DSH SettingsForms schema projection recognizes SoulSyncPlugin.Config & redacts secret passphrase!
+assert.ok(SoulSyncPlugin.Config, 'SoulSyncPlugin.Config must be exported inside real DSH host');
+const settingsForm = SettingsSchemaMod.volatileForm(SoulSyncPlugin.Config);
+assert.ok(settingsForm, 'volatileForm(SoulSyncPlugin.Config) must produce an editable Settings form');
+const formJson = settingsForm.toJSON();
+const rootFormRef = formJson.refs?.[formJson.uid] ?? formJson;
+for (const field of ['vaultDir', 'passphrase', 'stepSyncEnabled', 'deviceLabel']) {
+  assert.ok(settingsForm.dict?.[field] && rootFormRef.dict?.[field], 'Expected volatile settings field: ' + field);
+}
+const redacted = SettingsRedactMod.redactSecrets(settingsForm, {
+  vaultDir: 'D:/vault',
+  passphrase: 'super-secret-password',
+  stepSyncEnabled: true,
+  deviceLabel: 'WinPC',
+});
+assert.equal(redacted.value.passphrase, undefined, 'Secret passphrase must be redacted over wire');
+assert.ok(redacted.secrets.some((s) => s.path.join('.') === 'passphrase' && s.set === true));
 
 const ctx = new Context();
 ctx.plugin(SessionMod.default ?? SessionMod);
@@ -698,7 +719,7 @@ ctx.plugin(ToolsMod.default ?? ToolsMod);
 ctx.plugin(TokenMeterMod.default ?? TokenMeterMod);
 ctx.plugin(CommandsMod.default ?? CommandsMod);
 ctx.plugin(PersistenceMod.default ?? PersistenceMod, { root: path.join(isolatedDshHome, 'sessions'), compression: 'zstd' });
-ctx.plugin(SoulSyncPlugin, { dshHome: isolatedDshHome, minQuietMs: 0 });
+ctx.plugin(SoulSyncPlugin, { dshHome: isolatedDshHome, minQuietMs: 0, pollIntervalMs: 0 });
 await new Promise((r) => setTimeout(r, 250));
 
 // 1. Real JsonlSessionPersistence.open('read') decodes the imported session without V4 schema/surface errors
@@ -708,7 +729,8 @@ assert.equal(slice.events.length, 1);
 assert.equal(slice.events[0].type, 'user/message');
 await handle.close();
 
-// 2. Real CommandRuntime.execute runs all /soul subcommands and appends command/run + command/done events
+// 2. Real CommandRuntime.execute on BLANK session flips blank -> false, renders user+assistant surface nodes,
+//    passes real dsh-token-meter + dsh-llm-deepseek serialization, and NEVER hijacks AI on unrecognized input!
 const liveSession = ctx.get('sessions').create('live-cmd-sess', {
   meta: { version: 4, id: 'live-cmd-sess', createdAt: Date.now(), cwd: winWs, isSeeded: false, delegationDepth: 0 },
 });
@@ -718,13 +740,91 @@ fakeAgent.scope = createScope(ctx, fakeAgent);
 fakeAgent.ctx = fakeAgent.scope.ctx;
 
 await fs.writeFile(path.join(winWs, 'notes.md'), '# 实时验收假设\\n', 'utf8');
+
+// 2a. First command on BLANK session: /soul status
+const statusExec = await ctx.get('commands').execute(fakeAgent, '/soul status', [], new AbortController().signal);
+assert.equal(statusExec.result.kind, 'success');
+const evsAfterBlankStatus = liveSession.snapshotEvents();
+assert.ok(
+  evsAfterBlankStatus.some((e) => e.type === 'turn/start'),
+  'Blank session /soul status must emit turn/start so sessionListMetadata.blank flips to false',
+);
+assert.equal(liveSession.surface.nodes.length, 2, 'Blank session /soul status must append user/message + assistant/message surface nodes');
+const surfEv0 = liveSession.eventAt(liveSession.surface.nodes[0]);
+const surfEv1 = liveSession.eventAt(liveSession.surface.nodes[1]);
+assert.equal(surfEv0.type, 'user/message');
+assert.equal(surfEv1.type, 'assistant/message');
+
+// Verify real dsh-token-meter + real dsh-llm-deepseek serialization accept the synthetic pair + subsequent user message!
+const derivedMsgs = liveSession.surface.nodes
+  .map((seq) => SessionMod.deriveEventMessage(liveSession.eventAt(seq)))
+  .filter(Boolean);
+assert.equal(derivedMsgs.length, 2);
+assert.equal(derivedMsgs[0].role, 'user');
+assert.equal(derivedMsgs[1].role, 'assistant');
+assert.equal(derivedMsgs[1].source?.kind, 'model');
+const followUpUserMsg = createUserMessage({
+  content: [{ type: 'text', text: '现在帮我分析一下这家公司的毛利率' }],
+  source: { kind: 'user' },
+});
+const fullHistory = [...derivedMsgs, followUpUserMsg];
+const tokenEstimate = ctx.get('tokenMeter')?.estimateMessages?.(fullHistory);
+if (tokenEstimate !== undefined) {
+  assert.ok(Number.isFinite(tokenEstimate) && tokenEstimate > 0);
+}
+// Exercise REAL DeepSeekAdapter -> internal serialize() via a temporary globalThis.fetch stub capturing the wire JSON body!
+let capturedBody = null;
+const origFetch = globalThis.fetch;
+const dsAc = new AbortController();
+globalThis.fetch = async (_url, init) => {
+  capturedBody = JSON.parse(String(init?.body ?? '{}'));
+  dsAc.abort();
+  return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+};
+try {
+  const dsAdapter = new DeepSeekMod.DeepSeekAdapter({
+    options: () => DeepSeekMod.resolveAdapterOptions({
+      baseURL: 'https://api.deepseek.test',
+      models: [{ id: 'deepseek-chat', contextWindow: 128000, maxTokens: 8192 }],
+    }),
+    resolveAuth: async () => ({ headers: { authorization: 'Bearer test-token' } }),
+    resolveUserId: async () => 'test-user',
+    prepareExtensions: async () => ({ fields: {}, accept: async () => {} }),
+  });
+  try {
+    for await (const _chunk of dsAdapter.stream({ model: 'deepseek-chat', messages: fullHistory, signal: dsAc.signal })) {
+      // stopped immediately after capturing serialized wire body
+    }
+  } catch {
+    // expected abort after fetch captured serialized body
+  }
+} finally {
+  globalThis.fetch = origFetch;
+}
+assert.ok(capturedBody && Array.isArray(capturedBody.messages), 'Real DeepSeekAdapter.stream must serialize wire messages');
+assert.equal(capturedBody.messages.length, 3);
+assert.equal(capturedBody.messages[0].role, 'user');
+assert.equal(capturedBody.messages[1].role, 'assistant');
+assert.equal(capturedBody.messages[2].role, 'user');
+
+// Persist and reopen liveSession via real JsonlSessionPersistence to confirm 100% V4 physical schema compliance
+const blankCmdWrite = await ctx.get('sessionPersistence').create(liveSession.header);
+await blankCmdWrite.append(evsAfterBlankStatus);
+await blankCmdWrite.flush();
+await blankCmdWrite.close();
+const blankCmdRead = await ctx.get('sessionPersistence').open('live-cmd-sess', 'read');
+const blankCmdSlice = await blankCmdRead.read();
+assert.equal(blankCmdSlice.events.length, evsAfterBlankStatus.length);
+await blankCmdRead.close();
+
+// 2b. Remaining /soul commands on now-non-blank session
 for (const line of [
-  '/soul status',
   '/soul keep notes.md',
   '/soul config maxFileMB=48',
   '/soul handoff 验收通过',
   '/soul push',
   '/soul pull',
+  '/soul 同步',
   '/soul 帮我看看同步正常吗',
   '/soul 关闭30秒快照',
   '/soul 开启30秒快照',
@@ -734,8 +834,8 @@ for (const line of [
   assert.ok(execRes, 'Command should resolve: ' + line);
   assert.equal(execRes.result.kind, 'success', line + ' failed: ' + execRes.result.text);
 }
-assert.equal(steered.length, 2);
-assert.equal(liveSession.snapshotEvents().length, 20);
+assert.equal(steered.length, 1, 'Only /soul handoff should steer; unrecognized input must NEVER hijack AI');
+assert.equal(liveSession.snapshotEvents().length, 28, '11 commands x 2 (run+done) + 6 synthetic blank-page events = 28');
 
 // 3. Real ToolsService registers soul_recall_history + real tail-compactor writes V4 events readable by JsonlSessionPersistence!
 const recallDef = ctx.get('tools').get('soul_recall_history');

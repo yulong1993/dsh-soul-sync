@@ -1,4 +1,12 @@
 {
+  "meta": {
+    "title": "Cross-OS Disaster Recovery & Soul Sync",
+    "description": "Zero-config cross-OS (Win ⇄ Mac) session auto-homing, silent 15s background sync, deliverable disaster recovery, and first-person soul continuity for DeepSeek Harness"
+  },
   "title": "Cross-OS Disaster Recovery & Soul Sync",
-  "description": "Cross-OS (Win ⇄ Mac) disaster recovery, deliverable sync, and first-person soul continuity suite for DeepSeek Harness, with natural-language /soul commands and configurable 30s step snapshots"
+  "description": "Zero-config cross-OS (Win ⇄ Mac) session auto-homing, silent 15s background sync, deliverable disaster recovery, and first-person soul continuity for DeepSeek Harness",
+  "vaultDir": "Sync vault folder path (e.g. Nutstore / OneDrive / iCloud shared folder used by both devices)",
+  "passphrase": "End-to-end encryption passphrase (AES-256-GCM; leave empty to keep existing local key unchanged)",
+  "stepSyncEnabled": "30-second disaster-recovery snapshot while running (when off, syncs cleanly at each turn end)",
+  "deviceLabel": "Device display label (e.g. Office-Win or Home-Mac, shown in status cards and branch titles)"
 }

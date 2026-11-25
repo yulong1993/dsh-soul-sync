@@ -1,4 +1,12 @@
 {
+  "meta": {
+    "title": "跨端防灾与灵魂接力 (Soul Sync)",
+    "description": "面向 DeepSeek Harness 的跨系统（Win ⇄ Mac）免配置会话自动归位、后台 15 秒无感静默同步、产出物防灾与第一人称灵魂延续套件"
+  },
   "title": "跨端防灾与灵魂接力 (Soul Sync)",
-  "description": "面向 DeepSeek Harness 的跨系统（Win ⇄ Mac）会话防灾备份、产出物同步与第一人称灵魂延续套件，支持 /soul 自然语言大白话指令与可开关的 30 秒步级防断电快照"
+  "description": "面向 DeepSeek Harness 的跨系统（Win ⇄ Mac）免配置会话自动归位、后台 15 秒无感静默同步、产出物防灾与第一人称灵魂延续套件",
+  "vaultDir": "同步金库文件夹路径（例如坚果云 / OneDrive / iCloud 同步目录，双机指向同一共享目录）",
+  "passphrase": "端到端加密口令（AES-256-GCM，双机填同一口令；留空则保持现有密钥不变）",
+  "stepSyncEnabled": "运行中每 30 秒防断电快照（关闭后仅在每轮对话结束时安全同步）",
+  "deviceLabel": "本机名称（例如「公司Win」「家里Mac」，用于在双机体检卡与分叉分支标题中标识来源）"
 }
