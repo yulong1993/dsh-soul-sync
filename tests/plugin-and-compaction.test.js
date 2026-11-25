@@ -880,6 +880,8 @@ test('nl-router & /soul natural-language routing: all Tier-1 direct intents and 
   assert.equal(parseNaturalSoulIntent('把家里Mac改过的东西拉下来').kind, 'pull');
   assert.equal(parseNaturalSoulIntent('我把Excel关了帮我把暂存文件落位').kind, 'pull');
   assert.equal(parseNaturalSoulIntent('帮我把现在的进度马上备份一下').kind, 'push');
+  assert.deepEqual(parseNaturalSoulIntent('compact'), { kind: 'compact', keepTurns: 3 });
+  assert.deepEqual(parseNaturalSoulIntent('帮我无损压缩一下'), { kind: 'compact', keepTurns: 3 });
   assert.equal(parseNaturalSoulIntent('怎么用').kind, 'help');
   assert.equal(parseNaturalSoulIntent('help').kind, 'help');
 

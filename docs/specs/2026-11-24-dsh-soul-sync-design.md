@@ -22,7 +22,11 @@
    - 精确最小路径重写（仅改 `HeaderLine.cwd`、`working-directory/change.data.cwd`、`deliverables/presented` 文件路径，严禁触碰消息体/流/思考签名）；
    - 快进合并与零 `seq` 偏移脑裂分叉（克隆新 `branchId` 并同步修正 `seq >= inheritedEventCount` 的 `session-log-deepseek/delivery-accepted.data.sessionId` 与子会话 `parentSession`）；
    - 运行态通过 `ctx.sessionPersistence` / `ctx.workspaceRegistry` / `ctx.storageDomain` 免重启更新，离线态校验无锁后安全更新 `storages/workspace.json` v2 并清理 `session_projcache`。
-4. **抗失忆压缩层（`lib/compaction-soul.js`）**：继承 `BasicCompactionEngine` 覆写 `summarize()`，强制母语第一人称“我/我们”叙述 + 6 大认知分节 + `Flash → V4Pro` 视觉文字桥接 + `retainRatio: 0.25`。
+4. **抗失忆压缩与多次压缩防衰减层（`lib/compaction-soul.js` + `lib/tail-compactor.js` + `lib/recall-tool.js`）**：
+   - 通过 `llm/stream` 瀑布流拦截（兼容 DSH Preset 隔离墙且 100% 保持 `options.messages.slice(0, -1)` 对象引用以命中 DeepSeek Prefix Cache）升级全部自动压缩与 `/compact` 指令为内嵌两段式防衰减结构（跨代锁定钢印共识 ≤ 600 字 / 显式翻案才可改 + 滑动金字塔里程碑 + 高危伤疤 ≤ 10 条 + `Flash → V4Pro` 视觉文字桥接 + 思维链/纠偏复盘），并内置流式输出体积收敛护栏同步修正 `text-delta` 与 `block-end.block.text`，确保恒满足 `framedSummaryTokenCount < shadowedRouteTokenCount`；
+   - 提供宿主侧保尾不断魂无损压缩器（`lib/tail-compactor.js`，支持 `/soul compact [保留轮数]` 与中文自然语言触发），在 `agent.runMaintenance` 锁内保留末尾 K 轮完整人类对话（含原生 `reasoning` 思维链与平衡的 `tool-call`/`tool/result` 配对），以标准 V4 四事件（省略 `sourceCommandId`）原子落盘并同步加密金库；
+   - 静态注册只读并发安全历史底稿回捞工具 `soul_recall_history`（`lib/recall-tool.js`），直接内存检索已被压缩折叠或剪枝隐藏的原始事件、思维链与原始工具输出；
+   - 叙事平面内置 `hasUnclosedCompaction` 护栏，自动跳过未闭合 `compaction/start` 瞬间的快照导出，杜绝跨机拉到半截锁状态。
 5. **产出平面（`lib/deliverable-plane.js` + `lib/artifact-worker.js`）**：
    - 四信号定向纳管（写文件工具、`deliverables/presented`、活跃会话期目录写事件、`outputs/**` + `/soul keep`），排除 `git ls-files` 与历史存量只读文件；
    - Worker 线程执行 1.5s 静默稳定守卫 + 容器尾标验尸闸（`.xlsx`/`.docx`/`.pptx` EOCD `PK\x05\x06`、`.pdf` `%%EOF`、`.png` `IEND`、`.parquet` `PAR1`）+ 双层密钥/Symlink/硬链接拦截 + Windows 文件名合法性净化；

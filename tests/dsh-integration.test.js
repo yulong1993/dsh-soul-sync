@@ -66,7 +66,7 @@ async function writeLocalSessionWithAttachment(dshHome, header, events, attachme
 }
 
 test.after(async () => {
-  await fs.rm(TEST_TMP_ROOT, { recursive: true, force: true });
+  await fs.rm(TEST_TMP_ROOT, { recursive: true, force: true, maxRetries: 6, retryDelay: 100 });
 });
 
 test('hygiene: .gitattributes, LF-only mac/bin scripts, and pure-ASCII PS 5.1 zero-error install-win.ps1', async () => {
@@ -682,11 +682,20 @@ const { Context } = await import(pathToFileURL(path.join(scopeDir, 'cordis', 'li
 const PersistenceMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-session-persistence-jsonl', 'lib', 'index.js')).href);
 const CommandsMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-commands', 'lib', 'index.js')).href);
 const SessionMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-session', 'lib', 'index.js')).href);
+const SystemPromptMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-system-prompt', 'lib', 'index.js')).href);
+const ToolsMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-tools', 'lib', 'index.js')).href);
+const TokenMeterMod = await import(pathToFileURL(path.join(scopeDir, 'dsh-token-meter', 'lib', 'index.js')).href);
+const { createUserMessage, createAssistantMessage } = await import(pathToFileURL(path.join(scopeDir, 'dsh-llm', 'lib', 'index.js')).href);
 const { createScope } = await import(pathToFileURL(path.join(scopeDir, 'dsh-scope', 'lib', 'index.js')).href);
 const SoulSyncPlugin = await import(pathToFileURL(path.join(repoRoot, 'lib', 'index.js')).href);
+const { compactSessionPreservingTail } = await import(pathToFileURL(path.join(repoRoot, 'lib', 'tail-compactor.js')).href);
+const { SOUL_COMPACTION_SECTIONS, SOUL_RECALL_HINT_LINE } = await import(pathToFileURL(path.join(repoRoot, 'lib', 'compaction-soul.js')).href);
 
 const ctx = new Context();
 ctx.plugin(SessionMod.default ?? SessionMod);
+ctx.plugin(SystemPromptMod.default ?? SystemPromptMod);
+ctx.plugin(ToolsMod.default ?? ToolsMod);
+ctx.plugin(TokenMeterMod.default ?? TokenMeterMod);
 ctx.plugin(CommandsMod.default ?? CommandsMod);
 ctx.plugin(PersistenceMod.default ?? PersistenceMod, { root: path.join(isolatedDshHome, 'sessions'), compression: 'zstd' });
 ctx.plugin(SoulSyncPlugin, { dshHome: isolatedDshHome, minQuietMs: 0 });
@@ -699,7 +708,7 @@ assert.equal(slice.events.length, 1);
 assert.equal(slice.events[0].type, 'user/message');
 await handle.close();
 
-// 2. Real CommandRuntime.execute runs all 6 /soul subcommands and appends command/run + command/done events
+// 2. Real CommandRuntime.execute runs all /soul subcommands and appends command/run + command/done events
 const liveSession = ctx.get('sessions').create('live-cmd-sess', {
   meta: { version: 4, id: 'live-cmd-sess', createdAt: Date.now(), cwd: winWs, isSeeded: false, delegationDepth: 0 },
 });
@@ -727,6 +736,125 @@ for (const line of [
 }
 assert.equal(steered.length, 2);
 assert.equal(liveSession.snapshotEvents().length, 20);
+
+// 3. Real ToolsService registers soul_recall_history + real tail-compactor writes V4 events readable by JsonlSessionPersistence!
+const recallDef = ctx.get('tools').get('soul_recall_history');
+assert.ok(recallDef, 'soul_recall_history must be registered in real DSH ToolsService');
+assert.equal(recallDef.isConcurrencySafe({ query: 'test' }), true);
+
+const compactSess = ctx.get('sessions').create('live-tail-compact-sess', {
+  meta: { version: 4, id: 'live-tail-compact-sess', createdAt: Date.now(), cwd: winWs, isSeeded: false, delegationDepth: 0 },
+});
+for (let t = 1; t <= 4; t += 1) {
+  compactSess.append('turn/start', { turn: t });
+  compactSess.append('step/start', { turn: t, step: 1 });
+  if (t === 1) {
+    compactSess.append('system/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: 'sys-live-0',
+        role: 'system',
+        content: [{ type: 'text', text: 'You are DSH.' }],
+        source: { kind: 'system-prompt' },
+      },
+    }, { surfaceOp: 'append' });
+  }
+  compactSess.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: ('第' + t + '轮：宁德时代2025Q3毛利率为22.4%，否决了DCF方案。').repeat(5) }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' });
+  compactSess.append('assistant/message', {
+    turn: t,
+    step: 1,
+    stream: [],
+    message: createAssistantMessage({
+      content: [
+        { type: 'reasoning', text: ('第' + t + '轮思维链复盘：保留关键口径与毛利率 22.4%。').repeat(4) },
+        { type: 'text', text: ('第' + t + '轮结论：已输出估值表 outputs/val_' + t + '.xlsx。').repeat(5) },
+      ],
+      source: { provider: 'deepseek', model: 'deepseek-v4-pro' },
+    }),
+  }, { surfaceOp: 'append' });
+  compactSess.append('step/end', { turn: t, step: 1 });
+  compactSess.append('turn/end', { turn: t });
+}
+
+const mockLlmCtx = {
+  get(key) {
+    if (key === 'llm') {
+      return {
+        defaultConfig: { provider: 'deepseek', model: 'deepseek-v4-pro' },
+        stream() {
+          const text = [
+            '[压缩代次: G1]',
+            SOUL_COMPACTION_SECTIONS[0],
+            '- 宁德时代2025Q3毛利率为22.4%，否决了DCF方案。',
+            '',
+            SOUL_COMPACTION_SECTIONS[1],
+            '- 前两轮分析已收敛。',
+            '',
+            SOUL_COMPACTION_SECTIONS[2],
+            '- 否决DCF方案。',
+            '',
+            SOUL_COMPACTION_SECTIONS[3],
+            '- (无)',
+            '',
+            SOUL_COMPACTION_SECTIONS[4],
+            '- outputs/val_1.xlsx, outputs/val_2.xlsx',
+            '',
+            SOUL_COMPACTION_SECTIONS[5],
+            '- ' + SOUL_RECALL_HINT_LINE,
+          ].join('\\n');
+          return (async function* () {
+            yield { type: 'block-start', index: 0, blockType: 'text' };
+            yield { type: 'text-delta', index: 0, text };
+            yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          })();
+        },
+      };
+    }
+    return ctx.get(key);
+  },
+};
+
+const compactOut = await compactSessionPreservingTail({
+  ctx: mockLlmCtx,
+  agent: { session: compactSess, runMaintenance: (fn) => fn(new AbortController().signal) },
+  session: compactSess,
+  keepTurns: 2,
+});
+assert.equal(compactOut.status, 'compacted', compactOut.message);
+assert.equal(compactOut.keptTurns, 2);
+
+// Verify soul_recall_history executes against the REAL DSH Session and retrieves shadowed Turn 1 & reasoning!
+const recallRes = await recallDef.execute(
+  { query: '宁德时代2025Q3毛利率为22.4%，否决了DCF方案' },
+  { agent: { session: compactSess }, signal: new AbortController().signal },
+);
+assert.ok(recallRes.includes('shadowed'), 'Expected shadowed hit from real DSH Session: ' + recallRes);
+assert.ok(recallRes.includes('22.4%'), 'Expected 22.4% in recall result');
+
+// Persist the compacted real DSH Session through real JsonlSessionPersistence, then reopen via open('read') & Session.fromRestore!
+const writeHandle = await ctx.get('sessionPersistence').create(compactSess.header);
+await writeHandle.append(compactSess.snapshotEvents());
+await writeHandle.flush();
+await writeHandle.close();
+
+const compactedHandle = await ctx.get('sessionPersistence').open('live-tail-compact-sess', 'read');
+const compactedSlice = await compactedHandle.read();
+const types = compactedSlice.events.map((e) => e.type);
+assert.ok(types.includes('compaction/start'));
+assert.ok(types.includes('compaction/summary'));
+assert.ok(types.includes('compaction/end'));
+const cpEv = compactedSlice.events.find((e) => e.type === 'user/message' && e.data?.source?.kind === 'compact-checkpoint');
+assert.ok(cpEv, 'Expected persisted compact-checkpoint user/message');
+assert.equal(cpEv.data.source.sourceCommandId, undefined, 'Persisted checkpoint must omit sourceCommandId');
+const restored = SessionMod.Session.fromRestore('live-tail-compact-sess', compactedSlice.events, compactedHandle.header ?? compactSess.header, 0, 'owned');
+assert.equal(restored.surface.nodes.length, 6, 'Restored surface should have system + checkpoint + 2 kept turns (4 events)');
+await compactedHandle.close();
+
 await ctx.fiber.dispose();
 console.log('ASAR_LIVE_SERVICES_OK');
 `;
@@ -743,7 +871,7 @@ console.log('ASAR_LIVE_SERVICES_OK');
       );
       assert.match(liveServicesRes.stdout, /ASAR_LIVE_SERVICES_OK/);
     } finally {
-      await fs.rm(sandboxDir, { recursive: true, force: true });
+      await fs.rm(sandboxDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 100 });
     }
   },
 );
