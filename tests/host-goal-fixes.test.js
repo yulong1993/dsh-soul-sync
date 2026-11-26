@@ -1454,6 +1454,24 @@ test('Release-Gate: Neon P0 #1 (UI payload C2 guard), P0 #3 (CLI init/doctor wro
     );
     const vaultBStatsAfter = await peerBCtrl.vault.countReadableDeviceStats();
     assert.equal(vaultBStatsAfter.peerFailedCount, 0, 'Neon CHK2B: vaultB MUST NOT be polluted by blocked switch');
+
+    // 1b. Opus CHK2B-3: Switching `vaultDir` WITHOUT passing `passphrase` (UI clears `connPassphrase` to "")
+    //     MUST ALSO block & roll back `vaultDir` so subsequent `pushAll()` never pollutes `vaultB`!
+    const switchNoPassRes = await winCtrl.updateSettings({
+      vaultDir: vaultB,
+      deviceLabel: 'Win-Good',
+      stepSyncEnabled: true,
+    });
+    assert.equal(switchNoPassRes.keyUpdateBlocked, true, 'CHK2B-3: vaultDir-only switch to differently-encrypted vaultB must be blocked');
+    assert.equal(switchNoPassRes.requiresKeyRotationConfirm, true);
+    assert.equal(
+      path.resolve(winCtrl.config.vaultDir).toLowerCase(),
+      path.resolve(vaultDir).toLowerCase(),
+      'CHK2B-3: vaultDir must stay on vaultA when vaultDir-only switch cannot decrypt vaultB',
+    );
+    await winCtrl.pushAll();
+    const vaultBStatsAfterPush = await peerBCtrl.vault.countReadableDeviceStats();
+    assert.equal(vaultBStatsAfterPush.peerFailedCount, 0, 'CHK2B-3: subsequent pushAll must NOT pollute vaultB');
     await peerBCtrl.dispose();
 
     // 2. Neon P0 #3: `dsh-soul init --map ... --passphrase WRONG` MUST fail with exit 1 without polluting vault,
@@ -1559,15 +1577,15 @@ test('Release-Gate: Neon P0 #1 (UI payload C2 guard), P0 #3 (CLI init/doctor wro
       false,
       'Opus G2: selected-mode peer must NOT re-push withdrawn session back into vault',
     );
-    // Win switches back to `active` via `/soul scope active` -> MUST restore and resume pushing!
-    const scopeRes = await legWinCtrl.handleSetScope({ scope: 'active' });
-    assert.equal(scopeRes.kind, 'success');
+    // Win switches back to `active` via `/soul config scope=active` (CHK5A-3) -> MUST restore and resume pushing!
+    const cfgScopeRes = await legWinCtrl.handleConfig({ argsText: 'scope=active' });
+    assert.equal(cfgScopeRes.kind, 'success');
     const backActivePush = await legWinCtrl.pushAll();
     const vaultAfterBackActive = await legWinCtrl.vault.listCommits('session');
     assert.ok(
       backActivePush.sessionPushedCount >= 1
       && vaultAfterBackActive.commits.some((c) => c.targetId === 'sess-unselected-recover'),
-      'Neon CHK5A: switching back to syncScope=active must resume syncing previously unselected session',
+      'CHK5A-3: `/soul config scope=active` must restore non-excluded withdrawn sessions and resume syncing',
     );
 
     // 5. Neon P2 #6: `OPTIONS` checks `connection.requestRejection` BEFORE 204 and never reflects `dsh-app://app`
