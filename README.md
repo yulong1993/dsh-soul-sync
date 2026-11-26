@@ -81,7 +81,12 @@ bash ./scripts/install-mac.sh \
 ### 零感知自动防灾与跨机续聊（平时什么都不用敲）
 
 - **每轮结束自动加密入库（始终常开）**：每聊完一轮，完整原装对话、原生思维链、附图附件以及 `outputs/` 下的报告/表格/脚本自动静默同步到金库。
-- **启动秒拉 + 后台每 15 秒无感刷新侧边栏**：另一台电脑打开 DeepSeek Harness（哪怕一直开着没关，也会每 15 秒轻量检测网盘新快照），**原装对话会自动置顶出现在左侧会话列表第 1 条**，直接点开就能顺着上一句继续聊！
+- **启动秒拉 + 后台每 15 秒无感刷新侧边栏**：另一台电脑打开 DeepSeek Harness（哪怕一直开着没关，也会每 15 秒轻量检测网盘新快照），**按最后发言时间排序将最新对话置顶出现在左侧会话列表第 1 条**，同时联动置顶刚更新的工作区，直接点开就能顺着上一句继续聊！
+- **多工作区自由选择（「自动同名生成」vs「严格一一对应」+「按需勾选迁移」）**：
+  - 点击 DSH 左下角 **「设置 → Soul Sync 跨机迁移」** 即可打开原生可视化面板：
+    - **文件夹对应方式二选一**：支持 **✨ 自动同名生成并对应**（已配对走一一对应，未配对目录自动匹配本机同名工作区或在 `~/Documents/deepseek-harness/workspaces/<项目名>` 自动建独立同名目录，绝不把多个不同工作区混进同一个 `default-workspace`）或 **🔗 严格仅同步手动一一对应的文件夹**；
+    - **日常自动同步范围二选一**：支持 **🟢 自动同步活跃对话（自动剔除 0 轮空壳窗口）** 或 **🎯 精选白名单模式（仅同步勾选的工作区与对话，其余 100% 留在单机本地）**；
+    - **选择性迁移工作台**：支持按工作区或单条对话勾选加密推送 / 从金库按需拉取（拉取时可当场改选落入本机任意目录并一键保存为永久对应）。
 - **图形化「设置 → 插件」面板**：随时可在 DSH 左下角 **「设置 → 插件」** 里可视化修改金库路径、加密口令（脱敏密码框）、设备名与 30 秒步级防断电快照开关。
 
 ### 可选 `/soul` 快捷指令（毫秒级秒回，空白欢迎页也可直接展示）
@@ -158,6 +163,10 @@ bash ./scripts/install-mac.sh \
 | `/soul 关闭30秒快照` / `/soul 开启30秒快照` | `/soul config stepSync=off\|on` | 独立关闭或开启运行中每 30 秒步级防断电快照（不影响每轮结束自动同步） |
 | `/soul 把单文件上限改成 100M` | `/soul config maxFileMB=100` | 实时调整单文件上限、工作区上限、历史保留份数、快照间隔等配额 |
 | `/soul 绑定目录 D:\港股研究 到 /Users/me/港股研究` | `dsh-soul init --map ...` | 动态添加跨系统工作区目录映射并立即生效 |
+| `/soul 看看有哪些对话可以迁移` | `/soul list` | 列出本机与金库中所有可迁移的工作区、对话短 ID 与同步状态（自动过滤空窗口） |
+| `/soul push 量化` / `/soul pull #1` | `/soul push\|pull <目标...>` | 按工作区名、对话短 ID、标题关键词或 `#编号` 精准选择性推送或拉取 |
+| `/soul 切换严格一一对应模式` | `/soul mode auto\|mapped` | 切换「自动同名生成 (`auto-mirror`)」或「严格一一对应 (`mapped-only`)」 |
+| `/soul 切换精选模式` | `/soul scope active\|selected` | 切换「活跃自动同步 (`active`)」或「精选白名单同步 (`selected`)」 |
 | `/soul 同步一下` / `/soul 恢复` | `/soul sync` | 立即执行毫秒级确定性双向同步（先拉取远端更新归位侧边栏，再推送本机最新进度） |
 
 ### B. 独立命令行工具（`node ./bin/dsh-soul.js` 或 `dsh-soul`）
@@ -166,8 +175,9 @@ bash ./scripts/install-mac.sh \
 | --- | --- |
 | `dsh-soul init [选项]` | 交互式或参数化初始化配置、金库、加密口令、工作区映射、30秒快照开关（`--no-step-sync` / `--step-sync on\|off`）与技能 |
 | `dsh-soul status` | 查看完整双机同步与本地会话/工作区统计报告 |
-| `dsh-soul push [--workspace <目录>]` | 离线全量备份本机全部会话、`AGENTS.md` 与所有映射工作区产出物 |
-| `dsh-soul pull [--force]` | 离线全量恢复/合并（若检测到桌面端正在运行会温和保护，可传 `--force` 强制） |
+| `dsh-soul catalog` | 盘点本机与金库中所有可迁移的工作区与对话清单 |
+| `dsh-soul push [--only-workspace <名>] [--only-session <id>]` | 备份本机活跃/精选会话闭包与产出物（支持按工作区或对话 ID 精准推送） |
+| `dsh-soul pull [--only-workspace <名>] [--only-session <id>] [--target <源::本机目录>] [--force]` | 从金库恢复/合并会话与产出物（支持按需勾选拉取与当场指定本机目标目录） |
 | `dsh-soul keep <路径> [--workspace <目录>]` | 手动纳管指定文件并立即推送 |
 | `dsh-soul config [key=value ...]` | 查看或修改 `stepSync`、`stepSyncEnabled`、`maxFileMB`、`maxWorkspaceMB`、`retainSnapshots`、`stepSyncIntervalMs`、`trashRetentionDays`、`deviceLabel`、`vaultDir` |
 | `dsh-soul doctor` | 全面自检配置、金库可读写性、加密密钥、技能、规则块与 DSH 插件注册状态 |

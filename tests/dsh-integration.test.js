@@ -549,7 +549,11 @@ test(
       );
 
       // ACTUALLY BOOT real DeepSeek Harness `web` profile runtime (`@deepseek-ai/cordis`)
-      // and verify `dsh-soul-sync` activates with ZERO errors and executes live startup auto-pull!
+      // and verify:
+      //  1) `dsh-soul-sync` activates with ZERO errors and executes live startup auto-pull;
+      //  2) DSH serves `dsh-soul-sync` `./client` bundle via `/plugins/...` (HTTP 200) and injects it into `__DSH_BOOT__`;
+      //  3) Loopback same-origin API `/__soul-sync/api/...` blocks CSRF requests without `x-dsh-soul-sync: 1` or evil Origin,
+      //     and returns live `localCatalog` / `vaultCatalog` + supports settings update & selective pull!
       const bootResult = await new Promise((resolve, reject) => {
         const child = spawn(
           LOCAL_DSH_EXE,
@@ -569,6 +573,9 @@ test(
         let stdout = '';
         let stderr = '';
         let settled = false;
+        let httpChecksStarted = false;
+        let httpReport = null;
+        let httpError = null;
 
         const finish = () => {
           if (settled) return;
@@ -583,16 +590,99 @@ test(
         const timeout = setTimeout(() => {
           finish();
           reject(new Error(`Timed out waiting for live dsh web boot.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`));
-        }, 25000);
+        }, 30000);
 
         child.stdout.on('data', (chunk) => {
           stdout += chunk.toString('utf8');
-          if (stdout.includes('dsh web: http://127.0.0.1:')) {
-            // Give async controller.start() 1500ms to finish live pullSessionsFromVault + WorkspaceRegistry reconciliation
-            setTimeout(() => {
-              clearTimeout(timeout);
-              finish();
-            }, 1500);
+          const urlMatch = /dsh web:\s+(http:\/\/127\.0\.0\.1:\d+[^\r\n]*)\r?\n/.exec(stdout);
+          if (urlMatch && !httpChecksStarted) {
+            httpChecksStarted = true;
+            const fullLaunchUrl = urlMatch[1].trim();
+            const baseUrl = new URL(fullLaunchUrl).origin;
+            (async () => {
+              // Wait briefly for async controller.start() to finish startup auto-pull
+              await new Promise((r) => setTimeout(r, 1500));
+
+              // A. Authenticate with DSH launch token URL (collect session cookie), then fetch index & plugin bundle
+              const authResp = await fetch(fullLaunchUrl, { redirect: 'manual' });
+              const rawCookies = typeof authResp.headers.getSetCookie === 'function'
+                ? authResp.headers.getSetCookie()
+                : (authResp.headers.get('set-cookie') ? [authResp.headers.get('set-cookie')] : []);
+              const cookieHeader = rawCookies.map((c) => c.split(';')[0]).filter(Boolean).join('; ');
+              const authHeaders = cookieHeader ? { cookie: cookieHeader } : {};
+
+              const indexResp = authResp.status === 200
+                ? authResp
+                : await fetch(`${baseUrl}/`, { headers: authHeaders });
+              const indexHtml = await indexResp.text();
+              const bootIncludesPlugin = indexHtml.includes('"id":"dsh-soul-sync"');
+              const bundleUrlMatch = /"id":"dsh-soul-sync"[^}]*"url":"([^"]+)"/.exec(indexHtml);
+              let clientBundleStatus = 0;
+              let clientBundleText = '';
+              if (bundleUrlMatch) {
+                const relUrl = bundleUrlMatch[1].replace(/\\u0026/g, '&');
+                const bundleResp = await fetch(`${baseUrl}/${relUrl.replace(/^\/+/, '')}`, { headers: authHeaders });
+                clientBundleStatus = bundleResp.status;
+                clientBundleText = await bundleResp.text();
+              }
+
+              // B. Verify CSRF protection: missing custom header -> 403; evil Origin -> 403
+              const noHeaderResp = await fetch(`${baseUrl}/__soul-sync/api/state`);
+              const evilOriginResp = await fetch(`${baseUrl}/__soul-sync/api/state`, {
+                headers: { 'x-dsh-soul-sync': '1', origin: 'https://evil.example.com' },
+              });
+
+              // C. Verify authenticated loopback GET /__soul-sync/api/state
+              const stateResp = await fetch(`${baseUrl}/__soul-sync/api/state`, {
+                headers: { 'x-dsh-soul-sync': '1' },
+              });
+              const stateJson = await stateResp.json();
+
+              // D. Verify POST /__soul-sync/api/settings toggles folderMatchMode & syncScope live
+              const settingsResp = await fetch(`${baseUrl}/__soul-sync/api/settings`, {
+                method: 'POST',
+                headers: { 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
+                body: JSON.stringify({ folderMatchMode: 'mapped-only', syncScope: 'selected' }),
+              });
+              const settingsJson = await settingsResp.json();
+
+              // Reset back to auto-mirror / active so subsequent checks see clean defaults
+              await fetch(`${baseUrl}/__soul-sync/api/settings`, {
+                method: 'POST',
+                headers: { 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
+                body: JSON.stringify({ folderMatchMode: 'auto-mirror', syncScope: 'active' }),
+              });
+
+              // E. Verify POST /__soul-sync/api/pull-selected works end-to-end against live host
+              const pullSelResp = await fetch(`${baseUrl}/__soul-sync/api/pull-selected`, {
+                method: 'POST',
+                headers: { 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
+                body: JSON.stringify({ sessionIds: [liveSessId] }),
+              });
+              const pullSelJson = await pullSelResp.json();
+
+              httpReport = {
+                indexStatus: indexResp.status,
+                bootIncludesPlugin,
+                clientBundleStatus,
+                clientBundleText,
+                noHeaderStatus: noHeaderResp.status,
+                evilOriginStatus: evilOriginResp.status,
+                stateStatus: stateResp.status,
+                stateJson,
+                settingsStatus: settingsResp.status,
+                settingsJson,
+                pullSelStatus: pullSelResp.status,
+                pullSelJson,
+              };
+            })()
+              .catch((err) => {
+                httpError = err;
+              })
+              .finally(() => {
+                clearTimeout(timeout);
+                finish();
+              });
           }
         });
 
@@ -607,9 +697,28 @@ test(
 
         child.on('close', () => {
           clearTimeout(timeout);
-          resolve({ stdout, stderr });
+          resolve({ stdout, stderr, httpReport, httpError });
         });
       });
+
+      assert.equal(bootResult.httpError, null, `Live HTTP verification error: ${bootResult.httpError}`);
+      assert.ok(bootResult.httpReport, 'Live HTTP verification must run against running DSH web host');
+      assert.equal(bootResult.httpReport.indexStatus, 200);
+      assert.equal(bootResult.httpReport.bootIncludesPlugin, true, 'DSH __DSH_BOOT__ must include dsh-soul-sync client entry');
+      assert.equal(bootResult.httpReport.clientBundleStatus, 200, 'DSH /plugins/ bundle for dsh-soul-sync/client must return 200');
+      assert.match(bootResult.httpReport.clientBundleText, /window\.__ModuleLoader__\.load/);
+      assert.match(bootResult.httpReport.clientBundleText, /Soul Sync 跨机迁移/);
+      assert.equal(bootResult.httpReport.noHeaderStatus, 403, 'CSRF guard must reject requests without x-dsh-soul-sync header');
+      assert.equal(bootResult.httpReport.evilOriginStatus, 403, 'CSRF guard must reject non-loopback Origin');
+      assert.equal(bootResult.httpReport.stateStatus, 200);
+      assert.equal(bootResult.httpReport.stateJson.ok, true);
+      assert.ok(bootResult.httpReport.stateJson.localCatalog.totalSessions >= 1);
+      assert.ok(bootResult.httpReport.stateJson.vaultCatalog.totalSessions >= 1);
+      assert.equal(bootResult.httpReport.settingsStatus, 200);
+      assert.equal(bootResult.httpReport.settingsJson.config.folderMatchMode, 'mapped-only');
+      assert.equal(bootResult.httpReport.settingsJson.config.syncScope, 'selected');
+      assert.equal(bootResult.httpReport.pullSelStatus, 200);
+      assert.equal(bootResult.httpReport.pullSelJson.ok, true);
 
       assert.match(bootResult.stdout, /dsh web: http:\/\/127\.0\.0\.1:\d+/);
       assert.equal(
@@ -975,3 +1084,72 @@ console.log('ASAR_LIVE_SERVICES_OK');
     }
   },
 );
+
+test('bin/dsh-soul.js CLI selective migration: catalog, push --only-session/--only-workspace, pull --only-workspace --target', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'cli-selective');
+  const winHome = path.join(caseDir, 'win-home');
+  const macHome = path.join(caseDir, 'mac-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const wsQuant = path.join(caseDir, '量化');
+  const wsNotes = path.join(caseDir, '笔记');
+  const macTargetQuant = path.join(caseDir, 'mac-quant-target');
+  await fs.mkdir(wsQuant, { recursive: true });
+  await fs.mkdir(wsNotes, { recursive: true });
+  await fs.mkdir(macTargetQuant, { recursive: true });
+
+  const winInitIo = makeMemoryIo({ platform: 'win32' });
+  assert.equal(
+    await runCli(['--dsh-home', winHome, 'init', '--non-interactive', '--vault', vaultDir, '--no-passphrase', '--device-label', 'WinCLI'], winInitIo),
+    0,
+  );
+  const macInitIo = makeMemoryIo({ platform: process.platform });
+  assert.equal(
+    await runCli(['--dsh-home', macHome, 'init', '--non-interactive', '--vault', vaultDir, '--no-passphrase', '--device-label', 'MacCLI'], macInitIo),
+    0,
+  );
+
+  await writeLocalSessionWithAttachment(
+    winHome,
+    { version: 4, id: 'sess-cli-quant-1', cwd: wsQuant, createdAt: 1000 },
+    [{ seq: 0, time: 1100, type: 'user/message', data: { content: [{ type: 'text', text: '量化回测CLI测试' }] } }],
+    'q.txt',
+    Buffer.from('quant'),
+  );
+  await writeLocalSessionWithAttachment(
+    winHome,
+    { version: 4, id: 'sess-cli-notes-1', cwd: wsNotes, createdAt: 1200 },
+    [{ seq: 0, time: 1300, type: 'user/message', data: { content: [{ type: 'text', text: '私密笔记不推送' }] } }],
+    'n.txt',
+    Buffer.from('notes'),
+  );
+
+  const catIo = makeMemoryIo({ platform: 'win32' });
+  assert.equal(await runCli(['--dsh-home', winHome, 'catalog'], catIo), 0, catIo.getStderr());
+  assert.match(catIo.getStdout(), /量化回测CLI测试/);
+  assert.match(catIo.getStdout(), /私密笔记不推送/);
+
+  // Push ONLY 量化 workspace
+  const pushSelIo = makeMemoryIo({ platform: 'win32' });
+  assert.equal(
+    await runCli(['--dsh-home', winHome, 'push', '--only-workspace', '量化'], pushSelIo),
+    0,
+    pushSelIo.getStderr(),
+  );
+  assert.match(pushSelIo.getStdout(), /会话闭包 1 个/);
+
+  // Pull ONLY 量化 workspace into macTargetQuant via --target
+  const pullSelIo = makeMemoryIo({ platform: process.platform });
+  assert.equal(
+    await runCli(
+      ['--dsh-home', macHome, 'pull', '--only-workspace', '量化', '--target', `${wsQuant}::${macTargetQuant}`],
+      pullSelIo,
+    ),
+    0,
+    pullSelIo.getStderr(),
+  );
+  assert.match(pullSelIo.getStdout(), /会话新增 1/);
+
+  const macQuantLog = path.join(macHome, 'sessions', projectKey(macTargetQuant), encodeSegment('sess-cli-quant-1'), 'session.v4.jsonl.zstd');
+  const decoded = await decodeV4SessionLog(await fs.readFile(macQuantLog));
+  assert.equal(decoded.header.cwd.toLowerCase(), macTargetQuant.toLowerCase());
+});

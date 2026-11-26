@@ -1116,3 +1116,132 @@ test('background 15s poller auto-pulls new peer commits silently & volatile Sett
 
   await ctx.disposeAll();
 });
+
+test('selective sync: syncScope=selected, pushSelected, pullSelected with targetOverrides+saveMappings, and /soul list|mode|scope|push|pull', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'selective-sync');
+  const winHome = path.join(caseDir, 'win-home');
+  const macHome = path.join(caseDir, 'mac-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const wsA = path.join(caseDir, 'win-ws-a');
+  const wsB = path.join(caseDir, 'win-ws-b');
+  const wsC = path.join(caseDir, 'win-ws-c');
+  const macCustomTarget = path.join(caseDir, 'mac-custom-a');
+
+  await fs.mkdir(wsA, { recursive: true });
+  await fs.mkdir(wsB, { recursive: true });
+  await fs.mkdir(wsC, { recursive: true });
+  await fs.mkdir(macCustomTarget, { recursive: true });
+
+  await savePassphraseKey(winHome, 'selective-pass-2026');
+  await savePassphraseKey(macHome, 'selective-pass-2026');
+  await saveConfig(winHome, {
+    deviceId: 'win-sel',
+    deviceLabel: 'Win精选机',
+    platform: 'win32',
+    vaultDir,
+    encryptionEnabled: true,
+    syncScope: 'selected',
+    selectedWorkspaces: [],
+    selectedSessionIds: [],
+  });
+  await saveConfig(macHome, {
+    deviceId: 'mac-sel',
+    deviceLabel: 'Mac精选机',
+    platform: process.platform,
+    vaultDir,
+    encryptionEnabled: true,
+    folderMatchMode: 'mapped-only',
+    autoMirrorRoot: path.join(caseDir, 'mac-mirrors'),
+  });
+
+  await writeLocalSession(
+    winHome,
+    { type: 'session', version: 4, id: 'sess-a-0001', createdAt: 1000, cwd: wsA, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: 1100, type: 'user/message', data: { content: [{ type: 'text', text: 'A工作区第一条对话' }] } }],
+  );
+  await writeLocalSession(
+    winHome,
+    { type: 'session', version: 4, id: 'sess-a-0002', createdAt: 1200, cwd: wsA, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: 1300, type: 'user/message', data: { content: [{ type: 'text', text: 'A工作区第二条私密对话' }] } }],
+  );
+  await writeLocalSession(
+    winHome,
+    { type: 'session', version: 4, id: 'sess-b-0001', createdAt: 1400, cwd: wsB, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: 1500, type: 'user/message', data: { content: [{ type: 'text', text: 'B工作区量化对话' }] } }],
+  );
+  await writeLocalSession(
+    winHome,
+    { type: 'session', version: 4, id: 'sess-c-0001', createdAt: 1600, cwd: wsC, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: 1700, type: 'user/message', data: { content: [{ type: 'text', text: 'C工作区本地草稿' }] } }],
+  );
+
+  const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
+  await winCtrl.reloadConfig();
+
+  const emptyPush = await winCtrl.pushAll();
+  assert.equal(emptyPush.ok, true);
+  assert.equal(emptyPush.sessionPushedCount, 0);
+
+  const selPush = await winCtrl.pushSelected({
+    sessionIds: ['sess-a-0001', 'sess-b-0001'],
+    rememberSelection: true,
+  });
+  assert.equal(selPush.ok, true);
+  assert.equal(selPush.sessionPushedCount, 2);
+
+  const winCfgAfter = await loadConfig(winHome);
+  assert.deepEqual(winCfgAfter.selectedSessionIds, ['sess-a-0001', 'sess-b-0001']);
+
+  const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: process.platform, minQuietMs: 0, pollIntervalMs: 0 });
+  await macCtrl.reloadConfig();
+
+  const vaultCat = await macCtrl.listVaultCatalog();
+  assert.equal(vaultCat.totalSessions, 2);
+  const vaultSids = vaultCat.workspaces.flatMap((w) => w.sessions.map((s) => s.sessionId)).sort();
+  assert.deepEqual(vaultSids, ['sess-a-0001', 'sess-b-0001']);
+  assert.ok(vaultCat.workspaces.every((w) => w.targetMatchKind === 'unmapped-skipped'));
+
+  const selPull = await macCtrl.pullSelected({
+    sessionIds: ['sess-a-0001'],
+    targetOverrides: { [wsA]: macCustomTarget },
+    saveMappings: true,
+  });
+  assert.equal(selPull.ok, true);
+  assert.equal(selPull.sessions.summary.imported, 1);
+
+  const macLocalCat = await macCtrl.listLocalCatalog();
+  assert.equal(macLocalCat.totalSessions, 1);
+  assert.equal(macLocalCat.workspaces[0].sessions[0].sessionId, 'sess-a-0001');
+  assert.equal(macLocalCat.workspaces[0].path.toLowerCase(), macCustomTarget.toLowerCase());
+
+  const macCfgAfter = await loadConfig(macHome);
+  assert.equal(macCfgAfter.workspaceMappings.length, 1);
+
+  assert.equal(parseNaturalSoulIntent('list').kind, 'list');
+  assert.equal(parseNaturalSoulIntent('看看有哪些对话可以迁移').kind, 'list');
+  assert.deepEqual(parseNaturalSoulIntent('mode mapped'), { kind: 'set-mode', mode: 'mapped-only' });
+  assert.deepEqual(parseNaturalSoulIntent('mode auto'), { kind: 'set-mode', mode: 'auto-mirror' });
+  assert.deepEqual(parseNaturalSoulIntent('scope selected'), { kind: 'set-scope', scope: 'selected' });
+  assert.deepEqual(parseNaturalSoulIntent('scope active'), { kind: 'set-scope', scope: 'active' });
+  assert.deepEqual(parseNaturalSoulIntent('push sess-c-0001'), { kind: 'push', targets: ['sess-c-0001'] });
+
+  const listCmd = await winCtrl.handleSlashCommand({ rawInput: 'list' });
+  assert.equal(listCmd.kind, 'success');
+  assert.match(listCmd.text, /跨机迁移工作区与对话清单/);
+  assert.match(listCmd.text, /A工作区第一条对话/);
+
+  const modeCmd = await macCtrl.handleSlashCommand({ rawInput: 'mode auto' });
+  assert.equal(modeCmd.kind, 'success');
+  assert.equal((await loadConfig(macHome)).folderMatchMode, 'auto-mirror');
+
+  const scopeCmd = await winCtrl.handleSlashCommand({ rawInput: 'scope active' });
+  assert.equal(scopeCmd.kind, 'success');
+  assert.equal((await loadConfig(winHome)).syncScope, 'active');
+
+  const selectivePullCmd = await macCtrl.handleSlashCommand({ rawInput: 'pull sess-b-0001' });
+  assert.equal(selectivePullCmd.kind, 'success');
+  assert.match(selectivePullCmd.text, /会话新增 1/);
+
+  await winCtrl.dispose();
+  await macCtrl.dispose();
+});

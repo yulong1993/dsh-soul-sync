@@ -166,6 +166,10 @@ function parseArgv(argv) {
     stepSync: null,
     trashDays: null,
     workspace: null,
+    onlySessions: [],
+    onlyWorkspaces: [],
+    targets: [],
+    saveMapping: false,
     force: false,
     intervalMs: null,
   };
@@ -257,6 +261,20 @@ function parseArgv(argv) {
       const r = takeValue(argv, i, '--workspace');
       flags.workspace = r.value;
       i = r.nextIdx;
+    } else if (arg === '--only-session' || arg.startsWith('--only-session=')) {
+      const r = takeValue(argv, i, '--only-session');
+      flags.onlySessions.push(r.value);
+      i = r.nextIdx;
+    } else if (arg === '--only-workspace' || arg.startsWith('--only-workspace=')) {
+      const r = takeValue(argv, i, '--only-workspace');
+      flags.onlyWorkspaces.push(r.value);
+      i = r.nextIdx;
+    } else if (arg === '--target' || arg.startsWith('--target=')) {
+      const r = takeValue(argv, i, '--target');
+      flags.targets.push(r.value);
+      i = r.nextIdx;
+    } else if (arg === '--save-mapping') {
+      flags.saveMapping = true;
     } else if (arg === '--interval-ms' || arg.startsWith('--interval-ms=')) {
       const r = takeValue(argv, i, '--interval-ms');
       flags.intervalMs = r.value;
@@ -340,21 +358,20 @@ function formatHelpText() {
     '子命令：',
     '  init      初始化配置、防灾金库目录、可选口令加密、工作区映射与接力技能',
     '  status    输出双机同步体检报告（金库、加密、模型档位、会话数、产出数与 Excel 锁）',
-    '  push      离线全量备份本地会话闭包、全局 AGENTS.md 与映射工作区产出物',
-    '  pull      离线从金库恢复/三路合并会话、AGENTS.md 与工作区产出物（支持 --force）',
+    '  catalog   盘点本机与金库中所有可迁移的工作区与对话清单（过滤空窗口）',
+    '  push      备份本地会话闭包、AGENTS.md 与产出物（支持 --only-workspace / --only-session 按需推送）',
+    '  pull      从金库恢复/三路合并会话与产出物（支持 --only-workspace / --only-session / --target / --force）',
     '  keep      将指定文件手动纳入《产出账本》并立即推送至防灾金库',
-    '  config    查看或修改同步配额与基础配置（key=value）',
+    '  config    查看或修改同步配额、文件夹对应模式（folderMatchMode）与同步范围（syncScope）',
     '  doctor    全面自检配置、金库读写、密钥、技能、规则块与 DSH 插件注册状态',
     '  watch     启动轻量级后台守护模式，自动监测并周期备份会话与产出物',
     '',
     '常用示例：',
     '  dsh-soul init --non-interactive --vault "D:\\OneDrive\\dsh-vault" --passphrase "我的口令" --map "us=D:\\美股分析::/Users/me/美股分析" [--no-step-sync]',
-    '  dsh-soul status',
-    '  dsh-soul push',
-    '  dsh-soul pull',
-    '  dsh-soul keep outputs/valuation.xlsx',
-    '  dsh-soul config maxFileMB=64 retainSnapshots=15 stepSync=off',
-    '  dsh-soul doctor',
+    '  dsh-soul catalog',
+    '  dsh-soul push --only-workspace "量化" --only-session sess-abc',
+    '  dsh-soul pull --only-workspace "文章" --target "D:\\文章::/Users/me/文章"',
+    '  dsh-soul config folderMatchMode=mapped-only syncScope=selected',
   ].join('\n');
 }
 
@@ -527,6 +544,18 @@ async function runStatus(dshHome, io) {
   return 0;
 }
 
+async function runCatalog(dshHome, io) {
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+  const res = await controller.handleListCatalog();
+  io.out(res.text);
+  return 0;
+}
+
 async function runPush(flags, dshHome, io) {
   const controller = new SoulSyncController(null, {
     dshHome,
@@ -540,12 +569,44 @@ async function runPush(flags, dshHome, io) {
     return 1;
   }
 
+  const hasSelective = flags.onlySessions.length > 0 || flags.onlyWorkspaces.length > 0;
+  if (hasSelective) {
+    const localCat = await controller.listLocalCatalog();
+    const resolved = controller._resolveCatalogTargets(
+      localCat,
+      [...flags.onlyWorkspaces, ...flags.onlySessions],
+      false,
+    );
+    const wsPaths = [...new Set([...flags.onlyWorkspaces, ...resolved.workspaceSelectors])];
+    const sids = [...new Set([...resolved.sessionIds, ...flags.onlySessions.filter((s) => s.length > 10)])];
+    const selRes = await controller.pushSelected({
+      workspacePaths: wsPaths,
+      sessionIds: sids,
+    });
+    if (!selRes.ok) {
+      io.err(`选择性推送失败：${selRes.reason}`);
+      return 1;
+    }
+    const uploaded = selRes.workspaces.reduce((sum, w) => sum + w.uploaded.length, 0);
+    io.out(`选择性推送完成：会话闭包 ${selRes.sessionPushedCount} 个；工作区产出上传 ${uploaded} 个。`);
+    return 0;
+  }
+
   const globalRes = await controller.syncGlobalAgentsMd();
   const sessRes = await exportAllLocalSessions({
     dshHome,
     vault: controller.vault,
     workspaceMappings: controller.config.workspaceMappings,
     deviceLabel: controller.config.deviceLabel,
+    syncScope: controller.config.syncScope,
+    folderMatchMode: controller.config.folderMatchMode,
+    selectedWorkspaces: controller.config.selectedWorkspaces,
+    selectedSessionIds: controller.config.selectedSessionIds,
+    excludedSessionIds: controller.config.excludedSessionIds,
+    sessionTargetOverrides: controller.config.sessionTargetOverrides,
+    workspaceTargetOverrides: controller.config.workspaceTargetOverrides,
+    maxAutoSessionsPerWorkspace: controller.config.quotas?.maxAutoSessionsPerWorkspace ?? DEFAULT_QUOTAS.maxAutoSessionsPerWorkspace,
+    platform: io.platform,
   });
 
   const pushedIds = new Set();
@@ -632,6 +693,52 @@ async function runPull(flags, dshHome, io) {
     io.out('   建议在 DSH 对话框内执行 `/soul pull`，或先右键退出托盘 DeepSeek Harness 后重试（也可传 `--force` 强制离线导入）。');
   }
 
+  const hasSelective = flags.onlySessions.length > 0 || flags.onlyWorkspaces.length > 0;
+  const targetOverrides = {};
+  for (const spec of flags.targets) {
+    const sep = spec.indexOf('::');
+    if (sep <= 0) {
+      io.err(`无效的 --target 参数「${spec}」，格式应为 <源路径或会话ID>::<本机目标目录>`);
+      return 1;
+    }
+    const srcKey = spec.slice(0, sep).trim();
+    const dstDir = spec.slice(sep + 2).trim();
+    if (srcKey && dstDir) {
+      targetOverrides[srcKey] = dstDir;
+    }
+  }
+
+  if (hasSelective) {
+    if (skipSessions) {
+      io.out('⚠️ 检测到本机正在运行 DeepSeek Harness 桌面端：请改在 DSH 对话框内执行 `/soul pull ...` 或传 `--force`。');
+      return 0;
+    }
+    const vaultCat = await controller.listVaultCatalog();
+    const resolved = controller._resolveCatalogTargets(
+      vaultCat,
+      [...flags.onlyWorkspaces, ...flags.onlySessions],
+      true,
+    );
+    const wsSources = [...new Set([...flags.onlyWorkspaces, ...resolved.workspaceSelectors])];
+    const sids = [...new Set([...resolved.sessionIds, ...flags.onlySessions.filter((s) => s.length > 10)])];
+    const selRes = await controller.pullSelected({
+      workspaceSources: wsSources,
+      sessionIds: sids,
+      targetOverrides,
+      saveMappings: flags.saveMapping,
+    });
+    if (!selRes.ok) {
+      io.err(`选择性拉取失败：${selRes.reason}`);
+      return 1;
+    }
+    const s = selRes.sessions.summary;
+    const totalApplied = selRes.workspaces.reduce((acc, w) => acc + w.applied.length, 0);
+    io.out(
+      `选择性拉取完成：会话新增 ${s.imported} / 快进 ${s.fastForwarded} / 分叉 ${s.forkedBranches} / 跳过未对应 ${s.skippedUnmapped ?? 0}；产出更新 ${totalApplied} 个。`,
+    );
+    return 0;
+  }
+
   const globalRes = await controller.syncGlobalAgentsMd();
 
   let sessionSummary = { imported: 0, fastForwarded: 0, forkedBranches: 0, upToDate: 0 };
@@ -642,6 +749,14 @@ async function runPull(flags, dshHome, io) {
       workspaceMappings: controller.config.workspaceMappings,
       targetPlatform: io.platform,
       fallbackRoot: controller.config.fallbackDir || undefined,
+      folderMatchMode: controller.config.folderMatchMode,
+      autoMirrorRoot: controller.config.autoMirrorRoot || undefined,
+      syncScope: controller.config.syncScope,
+      selectedWorkspaces: controller.config.selectedWorkspaces,
+      selectedSessionIds: controller.config.selectedSessionIds,
+      excludedSessionIds: controller.config.excludedSessionIds,
+      sessionTargetOverrides: controller.config.sessionTargetOverrides,
+      workspaceTargetOverrides: { ...(controller.config.workspaceTargetOverrides ?? {}), ...targetOverrides },
     });
     sessionSummary = sessRes.summary;
   }
@@ -1078,6 +1193,9 @@ export async function runCli(argv = [], ioOverrides = {}) {
         return await runInit(flags, dshHome, io);
       case 'status':
         return await runStatus(dshHome, io);
+      case 'catalog':
+      case 'list':
+        return await runCatalog(dshHome, io);
       case 'push':
         return await runPush(flags, dshHome, io);
       case 'pull':
