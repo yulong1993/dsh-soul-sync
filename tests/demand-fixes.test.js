@@ -113,14 +113,14 @@ test('P0-1 / F1 + F14: Origin dsh-app://app preflight/GET/POST, Host header DNS-
   const ctrl = new SoulSyncController(null, { dshHome, platform: 'win32', pollIntervalMs: 0 });
   await ctrl.reloadConfig();
 
-  // 1. Electron desktop Origin: dsh-app://app -> OPTIONS 204, GET 200, POST 200
+  // 1. Electron desktop Origin: dsh-app://app -> OPTIONS 204 (without reflecting dsh-app://app ACAO), GET 200, POST 200
   const optRes = await callApi(ctrl, {
     method: 'OPTIONS',
     url: '/__soul-sync/api/state',
     headers: { origin: 'dsh-app://app', host: '127.0.0.1:3080' },
   });
   assert.equal(optRes.status, 204);
-  assert.equal(optRes.headers['access-control-allow-origin'], 'dsh-app://app');
+  assert.equal(optRes.headers['access-control-allow-origin'], undefined);
 
   const getRes = await callApi(ctrl, {
     method: 'GET',
@@ -340,7 +340,7 @@ test('P1-1 / F3 + P1-3: tri-state uncheck exclusion, whitelist prefill, vault un
   const freshHome = path.join(caseDir, 'fresh-selected-home');
   const out = [];
   const initCode = await runCli(
-    ['--dsh-home', freshHome, 'init', '--non-interactive', '--vault', vaultDir, '--no-passphrase', '--scope', 'selected'],
+    ['--dsh-home', freshHome, 'init', '--non-interactive', '--vault', vaultDir, '--passphrase', 'unpub-secret', '--scope', 'selected'],
     { stdout: (s) => out.push(s), stderr: (s) => out.push(s), isTTY: false },
   );
   assert.equal(initCode, 0, out.join(''));

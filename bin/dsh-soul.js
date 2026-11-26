@@ -19,6 +19,7 @@ import {
   saveConfig,
   savePassphraseKey,
   loadPassphraseKey,
+  derivePassphraseKey,
   ensureGlobalAgentsRules,
   writeFileAtomic,
   expandPosixHome,
@@ -187,6 +188,7 @@ function parseArgv(argv) {
     targets: [],
     saveMapping: false,
     force: false,
+    forceRotate: false,
     intervalMs: null,
   };
   const positionals = [];
@@ -213,6 +215,8 @@ function parseArgv(argv) {
       flags.nonInteractive = true;
     } else if (arg === '--no-passphrase') {
       flags.noPassphrase = true;
+    } else if (arg === '--force-rotate') {
+      flags.forceRotate = true;
     } else if (arg === '--no-step-sync') {
       flags.stepSync = false;
     } else if (arg === '--step-sync' || arg.startsWith('--step-sync=')) {
@@ -485,6 +489,41 @@ async function runInit(flags, dshHome, io) {
   }
   if (flags.trashDays !== null) {
     quotasPatch.trashRetentionDays = parsePositiveNumber(flags.trashDays, '--trash-days', { integer: true });
+  }
+
+  // Neon P0 #3: Check vault decryptability BEFORE overwriting key / publishing any global commit!
+  // Prevents `dsh-soul init --map ... --passphrase WRONG` from polluting the vault with an unreadable commit.
+  const willBeEncrypted = clearPassphrase || (passphrase !== null && passphrase === '')
+    ? false
+    : passphrase !== null
+      ? true
+      : Boolean(existing.encryptionEnabled);
+  const candidateKeys = !willBeEncrypted
+    ? null
+    : passphrase !== null
+      ? derivePassphraseKey(passphrase)
+      : await loadPassphraseKey(dshHome).catch(() => null);
+  if (!flags.forceRotate) {
+    const preProbeVault = new VaultStore({
+      vaultDir: resolvedVaultDir,
+      deviceId: existing.deviceId,
+      platform: io.platform,
+      secretKeys: candidateKeys,
+      quotas: { ...(existing.quotas ?? {}), ...quotasPatch },
+    });
+    const preStats = await preProbeVault.countReadableDeviceStats().catch(() => null);
+    if (
+      preStats
+      && (
+        (preStats.peerFailedCount > 0 && preStats.peerDecryptedCount === 0)
+        || (preStats.totalFailedCount > 0 && preStats.totalDecryptedCount === 0)
+      )
+    ) {
+      io.err(
+        `错误：当前口令无法解密金库中已有设备的 ${preStats.peerFailedCount || preStats.totalFailedCount} 条加密提交（0 条可读）！已中止初始化以避免用错误口令污染金库；请核对其他设备的加密口令后重试（如确需强制更换新口令请附加 --force-rotate）。`,
+      );
+      return 1;
+    }
   }
 
   let encryptionEnabled = existing.encryptionEnabled;
@@ -1002,10 +1041,14 @@ async function runDoctor(dshHome, io) {
           quotas: config.quotas,
         });
         const stats = await probeVault.countReadableDeviceStats();
-        if (stats.totalFailedCount > 0 && stats.totalDecryptedCount === 0) {
+        const allCommitsFailed = stats.totalFailedCount > 0 && stats.totalDecryptedCount === 0;
+        const allPeerCommitsFailed = stats.peerFailedCount > 0 && stats.peerDecryptedCount === 0;
+        if (allCommitsFailed || allPeerCommitsFailed) {
           fail(
             'vault-decrypt',
-            `金库中有 ${stats.totalFailedCount} 条现有提交全部解密失败（0 条可读）——本机口令与金库已有设备不一致，请核对口令后重新配置`,
+            allCommitsFailed
+              ? `金库中有 ${stats.totalFailedCount} 条现有提交全部解密失败（0 条可读）——本机口令与金库已有设备不一致，请核对口令后重新配置`
+              : `金库中对端设备的 ${stats.peerFailedCount} 条提交全部解密失败（0 条可读，仅本机提交可读）——本机口令与已有对端设备不一致，请核对口令后重新配置`,
           );
         } else if (stats.totalFailedCount > 0) {
           warn(

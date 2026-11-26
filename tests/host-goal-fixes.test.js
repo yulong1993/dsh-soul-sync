@@ -11,6 +11,7 @@ import {
   loadConfig,
   saveConfig,
   savePassphraseKey,
+  loadPassphraseKey,
   writeFileAtomic,
   deriveWorkspaceId,
 } from '../lib/config.js';
@@ -883,14 +884,18 @@ test('C2 + C3 + C3b + P2-3: majority-device passphrase guard (Scenario W), expli
     await winCtrl.pushAll();
     await macCtrl.pushAll();
 
-    // C3b: `dsh-soul doctor` on a fresh 2nd machine with wrong passphrase MUST FAIL with exit code 1!
+    // C3b + Neon P0 #3: `dsh-soul init` with wrong passphrase rejects immediately (exit 1), AND `dsh-soul doctor`
+    // on a machine holding a wrong secret.key MUST FAIL with `[FAIL] vault-decrypt` (exit code 1)!
     const badDocHome = path.join(caseDir, 'bad-doc-home');
     const initOut = [];
-    await runCli(
+    const badInitCode = await runCli(
       ['--dsh-home', badDocHome, 'init', '--non-interactive', '--vault', vaultDir, '--passphrase', 'completely-wrong-pass'],
       { stdout: (s) => initOut.push(s), stderr: (s) => initOut.push(s), isTTY: false },
     );
-    // Register a dummy web profile so only vault-decrypt causes failure
+    assert.equal(badInitCode, 1, 'Neon P0 #3: init with wrong passphrase must fail cleanly before polluting vault');
+    // Now configure badDocHome with wrong key directly and confirm `doctor` fails `[FAIL] vault-decrypt`!
+    await savePassphraseKey(badDocHome, 'completely-wrong-pass');
+    await saveConfig(badDocHome, { deviceId: 'bad-doc-dev', deviceLabel: 'BadDoc', platform: 'darwin', vaultDir, encryptionEnabled: true });
     await fs.mkdir(path.join(badDocHome, 'profiles', 'web'), { recursive: true });
     await fs.writeFile(path.join(badDocHome, 'profiles', 'web', 'package.json'), JSON.stringify({ dependencies: { 'dsh-soul-sync': 'link:.' } }), 'utf8');
     const docOut = [];
@@ -1137,4 +1142,393 @@ test('P1-2 + C6 + C8 + C9 + P2-1 + R6 + R7 + R8: unified CLI, unique mapping IDs
   assert.equal(p21Ctrl._startupErrors.length, 0, 'R8: transient startup error must auto-clear once vault recovers');
 
   await p21Ctrl.dispose();
+});
+
+
+// ============================================================================
+// FINAL RELEASE-GATE REGRESSION TESTS (Neon #1-#6 + Opus A3b & Legacy Probe C)
+// ============================================================================
+
+test('Release-Gate [REAL DSH HOST]: in-place idle liveSession fast-forward (0 api-session/removed), session/end-seed roundtrip, Cordis Symbol teardown & api-session/activity', {
+  skip: !HAS_REAL_DSH_HOST_PKGS ? 'Real @deepseek-ai/* packages not installed' : false,
+}, async () => {
+  const { Context } = await importRealDshPkg('@deepseek-ai/cordis');
+  const { Session, SessionStore } = await importRealDshPkg('@deepseek-ai/dsh-session');
+  const { SessionProjectionRegistry } = await importRealDshPkg('@deepseek-ai/dsh-session-projection');
+  const StoragePlugin = await importRealDshPkg('@deepseek-ai/dsh-storage');
+  const StorageDomainPlugin = await importRealDshPkg('@deepseek-ai/dsh-storage-domain');
+  const StorageJsonPlugin = await importRealDshPkg('@deepseek-ai/dsh-storage-json');
+  const SessionPersistenceJsonlPlugin = await importRealDshPkg('@deepseek-ai/dsh-session-persistence-jsonl');
+  const { SessionProjectionCache } = await importRealDshPkg('@deepseek-ai/dsh-session-projection-cache');
+  const { titleProjectionDefinition } = await importRealDshPkg('@deepseek-ai/dsh-session-title');
+
+  const caseDir = path.join(TEST_TMP_ROOT, 'gate-inplace-ff-endseed');
+  const winHome = path.join(caseDir, 'win-home');
+  const macHome = path.join(caseDir, 'mac-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const winWs = path.join(caseDir, 'win-ws');
+  const macWs = path.join(caseDir, 'mac-ws');
+  await fs.mkdir(winWs, { recursive: true });
+  await fs.mkdir(macWs, { recursive: true });
+  await fs.mkdir(vaultDir, { recursive: true });
+
+  const mappings = [{ id: 'gate-proj', title: 'GateProj', win32: winWs, darwin: macWs, linux: macWs }];
+  const sid = 'sess-gate-inplace-01';
+  const now = Date.now();
+  const turn1 = [
+    { seq: 0, time: now - 10000, type: 'turn/start', data: { turn: 1 } },
+    { seq: 1, time: now - 9900, type: 'user/message', surfaceOp: 'append', data: { id: 'm-u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Turn 1 from Win' }] } },
+    { seq: 2, time: now - 9800, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+  ];
+  const turn2 = [
+    ...turn1,
+    { seq: 3, time: now - 4000, type: 'turn/start', data: { turn: 2 } },
+    { seq: 4, time: now - 3900, type: 'user/message', surfaceOp: 'append', data: { id: 'm-u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Turn 2 from Mac' }] } },
+    { seq: 5, time: now - 3800, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } },
+  ];
+
+  await saveConfig(winHome, { deviceId: 'win-gate', deviceLabel: 'WinGate', platform: 'win32', vaultDir, workspaceMappings: mappings });
+  await saveConfig(macHome, { deviceId: 'mac-gate', deviceLabel: 'MacGate', platform: 'darwin', vaultDir, workspaceMappings: mappings });
+  await writeLocalSession(winHome, { type: 'session', version: 4, id: sid, createdAt: now - 11000, cwd: winWs, isSeeded: false, delegationDepth: 0 }, turn1);
+  await writeLocalSession(macHome, { type: 'session', version: 4, id: sid, createdAt: now - 11000, cwd: macWs, isSeeded: false, delegationDepth: 0 }, turn2);
+
+  // Mac pushes Turn 2
+  const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', pollIntervalMs: 0 });
+  await macCtrl.reloadConfig();
+  await macCtrl.pushAll();
+
+  // Boot REAL DSH host on Win and open `sid` live via real SessionStore + JsonlSessionPersistence
+  const ctx = new Context();
+  await Promise.all([
+    ctx.plugin(StoragePlugin.default),
+    ctx.plugin(StorageJsonPlugin, { root: path.join(winHome, 'storages') }),
+    ctx.plugin(StorageDomainPlugin, { backend: 'json' }),
+    ctx.plugin(SessionProjectionRegistry),
+    ctx.plugin(SessionStore),
+    ctx.plugin(SessionPersistenceJsonlPlugin, { root: path.join(winHome, 'sessions'), compression: 'zstd' }),
+    ctx.plugin(SessionProjectionCache, { writeEveryEvents: 100, writeIntervalMs: 50 }),
+  ]);
+
+  let writeHandle = null;
+  let detachSession = null;
+  let winCtrl = null;
+  try {
+    await ctx.sessionProjections.register(titleProjectionDefinition);
+    const { z } = await importRealDshPkg('zod').catch(async () => {
+      const req = createRequire(path.join(DSH_PROFILE_NODE_MODULES, '@deepseek-ai', 'dsh-session-projection-cache', 'package.json'));
+      return import(pathToFileURL(req.resolve('zod')).href);
+    });
+    const metaSchema = z.object({ blank: z.boolean(), lastPromptAt: z.number().nullable() });
+    await ctx.sessionProjections.register({
+      key: 'sessionListMetadata',
+      stateSchema: metaSchema,
+      init: () => ({ blank: true, lastPromptAt: null }),
+      apply: (state, event) => {
+        const blank = state.blank && event.type !== 'turn/start';
+        const lastPromptAt = event.type === 'user/message' && event.data?.source?.kind === 'user' ? event.time : state.lastPromptAt;
+        return blank === state.blank && lastPromptAt === state.lastPromptAt ? state : { blank, lastPromptAt };
+      },
+      wire: { viewSchema: metaSchema, view: (s) => s },
+      stateVersion: 1,
+    });
+
+    // Open session like real AgentLoop.resume() -> prepare + enter + announce + persist `session/end-seed`!
+    writeHandle = await ctx.sessionPersistence.open(sid, 'write');
+    const restored = await writeHandle.read(0);
+    const liveSession = ctx.sessions.prepare(sid, {
+      seed: restored.events,
+      meta: writeHandle.header,
+      inheritedEventCount: writeHandle.inheritedEventCount,
+      eventState: restored.eventState,
+    });
+    detachSession = ctx.sessions.enter(liveSession);
+    await ctx.sessions.announce(liveSession);
+    // Persist any unstored suffix from `prepare` (e.g., `session/end-seed`), or append one if absent
+    const afterPrepareEvents = liveSession.snapshotEvents();
+    if (afterPrepareEvents.length > restored.events.length) {
+      await writeHandle.append(afterPrepareEvents.slice(restored.events.length));
+      await writeHandle.flush();
+    } else {
+      liveSession.append('session/end-seed', {});
+      await ctx.sessions.flush(liveSession);
+    }
+
+    // Track `api-session/removed`, `api-session/added`, `api-session/activity`
+    const removedIds = [];
+    const addedSummaries = [];
+    const activityEvents = [];
+    ctx.on('session/disposed', (s) => removedIds.push(s?.id ?? s?.header?.id));
+    ctx.on('api-session/removed', (id) => removedIds.push(id));
+    ctx.on('api-session/added', (summary) => addedSummaries.push(summary));
+    ctx.on('api-session/activity', (id, updatedAt) => activityEvents.push({ id, updatedAt }));
+
+    // Register idle agent with real `runMaintenance` + `setPhase` + Cordis Symbol-labeled effect
+    const agentStore = new Map();
+    const fakeAgent = {
+      id: sid,
+      status: 'idle',
+      phase: { kind: 'idle', lastTurn: 1 },
+      inbox: { hasPending: false },
+      session: liveSession,
+      maintenanceRan: false,
+      setPhase(next) { this.phase = next; },
+      async runMaintenance(job) {
+        this.maintenanceRan = true;
+        const prev = this.phase.lastTurn;
+        this.phase = { kind: 'maintenance', lastTurn: prev };
+        try {
+          return await job(new AbortController().signal);
+        } finally {
+          this.phase = { kind: 'idle', lastTurn: prev };
+        }
+      },
+    };
+    agentStore.set(sid, fakeAgent);
+    ctx.provide('agents', { get: (id) => agentStore.get(id), store: agentStore });
+
+    winCtrl = new SoulSyncController(ctx, { dshHome: winHome, platform: 'win32', pollIntervalMs: 0 });
+    await winCtrl.reloadConfig();
+
+    // 1. Pull Mac Turn 2 while Win has open idle tab + `session/end-seed`!
+    const pullWin = await winCtrl.pullAll();
+    assert.equal(pullWin.ok, true);
+    assert.equal(pullWin.sessions.summary.fastForwarded, 1, 'P0-2c: session/end-seed must NOT cause false fork');
+    assert.equal(pullWin.sessions.summary.forkedBranches, 0);
+    assert.equal(pullWin.sessions.results[0].appliedInPlace, true, 'P0-2a: must fast-forward liveSession IN PLACE');
+    assert.equal(fakeAgent.maintenanceRan, true, 'P0-2a: must execute inside agent.runMaintenance');
+    assert.equal(fakeAgent.phase.lastTurn, 2, 'P0-2a: must advance agent.phase.lastTurn to 2');
+    assert.equal(removedIds.length, 0, 'P0-2a / Opus A3b: MUST emit ZERO session/disposed or api-session/removed!');
+    assert.ok(addedSummaries.some((s) => s.sessionId === sid), 'api-session/added must fire');
+    assert.ok(activityEvents.some((e) => e.id === sid && e.updatedAt > 0), 'P1 #4: api-session/activity must fire with updatedAt');
+
+    const liveAfterFF = liveSession.snapshotEvents();
+    assert.equal(liveAfterFF.length, 7, '3 original + 1 session/end-seed + 3 Turn 2 events');
+    assert.equal(liveAfterFF[5].data.content[0].text, 'Turn 2 from Mac');
+
+    // 2. Now Win appends Turn 3 on the SAME open liveSession and pushes -> Mac MUST fast-forward cleanly (0 false fork!)
+    liveSession.append('turn/start', { turn: 3 });
+    liveSession.append('user/message', { id: 'm-u3', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Turn 3 from Win after in-place FF' }] }, { surfaceOp: 'append' });
+    liveSession.append('turn/end', { turn: 3, reason: { kind: 'completed' } });
+    await ctx.sessions.flush(liveSession);
+    await winCtrl.pushAll();
+
+    const pullMac = await macCtrl.pullAll();
+    assert.equal(pullMac.ok, true);
+    assert.equal(pullMac.sessions.summary.fastForwarded, 1, 'Roundtrip Turn 3 after in-place FF + session/end-seed must fast-forward cleanly on Mac');
+    assert.equal(pullMac.sessions.summary.forkedBranches, 0);
+
+    // 3. Verify P0-2b Cordis Symbol effect label matching in `_releaseIdleSession` clears `liveAgents` cleanly
+    const liveAgents = new Set([sid]);
+    const cordisEffectSym = Symbol('cordis.effect');
+    const teardownDisposable = () => {
+      liveAgents.delete(sid);
+      agentStore.delete(sid);
+    };
+    teardownDisposable[cordisEffectSym] = { label: `agentLoop.scope(${sid})` };
+    fakeAgent.loopCtx = { fiber: { _disposables: new Set([teardownDisposable]) } };
+    await winCtrl._releaseIdleSession(sid);
+    assert.equal(liveAgents.size, 0, 'P0-2b: Cordis Symbol(cordis.effect) teardown must execute and clear liveAgents');
+
+    // 4. Verify Opus P2 in-memory projCache fallback when projRegistry.restore throws
+    const brokenProjCtx = {
+      sessionProjections: { restore() { throw new Error('simulated unconfigured projection'); } },
+      sessionProjectionCache: ctx.sessionProjectionCache,
+      emit: ctx.emit.bind(ctx),
+    };
+    const fallbackSid = 'sess-projcache-fallback';
+    await writeLocalSession(winHome, { type: 'session', version: 4, id: fallbackSid, createdAt: now - 5000, cwd: winWs, isSeeded: false, delegationDepth: 0 }, turn1);
+    const macPushFallback = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', pollIntervalMs: 0 });
+    await macPushFallback.reloadConfig();
+    await writeLocalSession(macHome, { type: 'session', version: 4, id: fallbackSid, createdAt: now - 5000, cwd: macWs, isSeeded: false, delegationDepth: 0 }, turn2);
+    await macPushFallback.pushAll();
+    await macPushFallback.dispose();
+    const origProj = winCtrl.ctx;
+    const fbAdapter = {
+      ...winCtrl._buildCordisAdapter(),
+      sessionProjections: brokenProjCtx.sessionProjections,
+      fastForwardLiveSession: undefined,
+    };
+    const fbPull = await pullSessionsFromVault({
+      dshHome: winHome,
+      vault: winCtrl.vault,
+      workspaceMappings: winCtrl.config.workspaceMappings,
+      targetPlatform: 'win32',
+      cordisCtx: fbAdapter,
+      onlySessionIds: [fallbackSid],
+    });
+    assert.equal(fbPull.summary.fastForwarded, 1);
+    const fbRec = (await scanLocalSessions(winHome)).get(fallbackSid);
+    const fbSnap = ctx.sessionProjectionCache.cachedSnapshot(fbRec.header);
+    assert.ok(fbSnap, 'Opus P2: in-memory SessionProjectionCache must be warmed even when projRegistry.restore() throws');
+    assert.ok(fbSnap.values.sessionListMetadata.lastPromptAt > 0);
+  } finally {
+    try { detachSession?.(); } catch { /* ignore */ }
+    await writeHandle?.close?.().catch(() => {});
+    await winCtrl?.dispose?.().catch(() => {});
+    await macCtrl.dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('Release-Gate: Neon P0 #1 (UI payload C2 guard), P0 #3 (CLI init/doctor wrong-pass), Opus P1 (legacy ID preserve), Neon P1 #5 (withdrawUnselected->active), P2 #6 (OPTIONS auth)', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'gate-all-remaining');
+  const winHome = path.join(caseDir, 'win-home');
+  const macHome = path.join(caseDir, 'mac-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const winWs = path.join(caseDir, '文章');
+  const macWs = '/Users/mac/文章';
+  await fs.mkdir(winWs, { recursive: true });
+  await fs.mkdir(vaultDir, { recursive: true });
+
+  // 1. Neon P0 #1: Real Settings UI payload `{ vaultDir: currentVaultDir, passphrase: 'BAD_TYPO' }` MUST be blocked by C2!
+  await savePassphraseKey(winHome, 'GOOD_PASS');
+  await savePassphraseKey(macHome, 'BAD_TYPO');
+  await saveConfig(winHome, { deviceId: 'win-ui-c2', deviceLabel: 'WinGood', platform: 'win32', vaultDir, encryptionEnabled: true });
+  await saveConfig(macHome, { deviceId: 'mac-ui-c2', deviceLabel: 'MacTypo', platform: 'darwin', vaultDir, encryptionEnabled: true });
+
+  const now = Date.now();
+  for (let i = 1; i <= 5; i += 1) {
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: `sess-good-${i}`, createdAt: now - 50000 + i * 100, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: now - 49000 + i * 100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `Good session ${i}` }] } }],
+    );
+  }
+  await writeLocalSession(
+    macHome,
+    { type: 'session', version: 4, id: 'sess-bad-mac', createdAt: now - 1000, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: now - 900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Typo mac session' }] } }],
+  );
+
+  const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', pollIntervalMs: 0 });
+  const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', pollIntervalMs: 0 });
+  let legWinCtrl = null;
+  let legMacCtrl = null;
+  let authCtrl = null;
+  try {
+    await winCtrl.reloadConfig();
+    await macCtrl.reloadConfig();
+    await winCtrl.pushAll();
+    await macCtrl.pushAll();
+
+    const keyBefore = await loadPassphraseKey(winHome);
+    // Exact real UI payload sent by `lib/client.js` handleSaveConnectionClick!
+    const uiSaveRes = await winCtrl.updateSettings({
+      vaultDir: winCtrl.config.vaultDir,
+      deviceLabel: 'WinGood',
+      stepSyncEnabled: true,
+      passphrase: 'BAD_TYPO',
+    });
+    assert.equal(uiSaveRes.keyUpdateBlocked, true, 'Neon P0 #1: UI payload with unchanged vaultDir MUST hit C2 guard');
+    assert.equal(uiSaveRes.requiresKeyRotationConfirm, true);
+    const keyAfter = await loadPassphraseKey(winHome);
+    assert.equal(keyAfter.encKeyHex, keyBefore.encKeyHex, 'Neon P0 #1: Win secret.key MUST remain unchanged');
+    const winStatsAfter = await winCtrl.vault.countReadableDeviceStats();
+    assert.equal(winStatsAfter.ownSessionCount, 5, 'Neon P0 #1: all 5 good Win session commits MUST stay intact');
+
+    // 2. Neon P0 #3: `dsh-soul init --map ... --passphrase WRONG` MUST fail with exit 1 without polluting vault,
+    //    AND `dsh-soul doctor` MUST fail (`[FAIL] vault-decrypt`, exit 1) when peer commits fail even if own commit decrypts!
+    const macInitHome = path.join(caseDir, 'mac-init-wrong');
+    const initOut = [];
+    const initErr = [];
+    const initCode = await runCli(
+      ['--dsh-home', macInitHome, '--platform', 'darwin', 'init', '--non-interactive', '--vault', vaultDir, '--passphrase', 'WRONG_KEY', '--map', `${winWs}::${macWs}`],
+      { stdout: (s) => initOut.push(s), stderr: (s) => initErr.push(s) },
+    );
+    assert.equal(initCode, 1, `Neon P0 #3: init with wrong passphrase must return exit 1, stderr=${initErr.join('')}`);
+    assert.match(initErr.join(''), /无法解密/);
+
+    // Doctor check on `macCtrl` (which has 1 own commit readable under BAD_TYPO, but 0 peer commits readable & 5+ peer failed!)
+    const docOut = [];
+    const docCode = await runCli(
+      ['--dsh-home', macHome, '--platform', 'darwin', 'doctor'],
+      { stdout: (s) => docOut.push(s), stderr: (s) => docOut.push(s) },
+    );
+    assert.equal(docCode, 1, 'Neon P0 #3: doctor must exit 1 when all peer commits fail decryption');
+    assert.match(docOut.join(''), /\[FAIL\] vault-decrypt/);
+
+    // 3. Opus P1 Legacy Probe C: Un-timestamped legacy mapping ID `"文章"` MUST NOT be overwritten by peer's `"文章-xxxx"`!
+    const legacyVault = path.join(caseDir, 'legacy-vault');
+    const legWinHome = path.join(caseDir, 'leg-win');
+    const legMacHome = path.join(caseDir, 'leg-mac');
+    await fs.mkdir(legacyVault, { recursive: true });
+    await saveConfig(legWinHome, {
+      deviceId: 'leg-win',
+      deviceLabel: 'LegWin',
+      platform: 'win32',
+      vaultDir: legacyVault,
+      workspaceMappings: [{ id: '文章', title: '文章', win32: winWs, darwin: macWs }], // NO updatedAt (legacy!)
+    });
+    await saveConfig(legMacHome, {
+      deviceId: 'leg-mac',
+      deviceLabel: 'LegMac',
+      platform: 'darwin',
+      vaultDir: legacyVault,
+    });
+    legWinCtrl = new SoulSyncController(null, { dshHome: legWinHome, platform: 'win32', pollIntervalMs: 0 });
+    legMacCtrl = new SoulSyncController(null, { dshHome: legMacHome, platform: 'darwin', pollIntervalMs: 0 });
+    await legWinCtrl.reloadConfig();
+    await legMacCtrl.reloadConfig();
+    await legMacCtrl.handleAddMapping({ winPath: winWs, macPath: macWs, triggerPull: false });
+    assert.match(legMacCtrl.config.workspaceMappings[0].id, /^文章-[0-9a-f]{4}$/);
+    await legWinCtrl.syncGlobalWorkspaceMetadata();
+    assert.deepEqual(
+      legWinCtrl.config.workspaceMappings.map((m) => m.id),
+      ['文章'],
+      'Opus P1 Legacy Probe C: established legacy ID "文章" must be preserved against peer hashed ID',
+    );
+
+    // 4. Neon P1 #5: `withdrawUnselected` MUST NOT trap sessions when switching back to `syncScope: 'active'`!
+    await writeLocalSession(
+      legWinHome,
+      { type: 'session', version: 4, id: 'sess-unselected-recover', createdAt: now - 2000, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: now - 1900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Recoverable session' }] } }],
+    );
+    await legWinCtrl.pushAll();
+    await legWinCtrl.updateSettings({
+      syncScope: 'selected',
+      selectedSessionIds: [],
+      selectedWorkspaces: [],
+      withdrawUnselected: true,
+    });
+    assert.equal((legWinCtrl.config.withdrawnSessions ?? {})['sess-unselected-recover'], undefined, 'Neon P1 #5: withdrawUnselected must not write permanent withdrawnSessions tombstone');
+    await legWinCtrl.updateSettings({ syncScope: 'active' });
+    const backActivePush = await legWinCtrl.pushAll();
+    const vaultAfterBackActive = await legWinCtrl.vault.listCommits('session');
+    assert.ok(
+      backActivePush.sessionPushedCount >= 1
+      && vaultAfterBackActive.commits.some((c) => c.targetId === 'sess-unselected-recover'),
+      'Neon P1 #5: switching back to syncScope=active must resume syncing previously unselected session',
+    );
+
+    // 5. Neon P2 #6: `OPTIONS` checks `connection.requestRejection` BEFORE 204 and never reflects `dsh-app://app`
+    const mockAuthCtx = {
+      connection: {
+        requestRejection(req) {
+          return req.headers?.cookie === 'dsh_auth=valid' ? undefined : 401;
+        },
+      },
+    };
+    authCtrl = new SoulSyncController(mockAuthCtx, { dshHome: legWinHome, platform: 'win32', pollIntervalMs: 0 });
+    await authCtrl.reloadConfig();
+    const unauthOpt = await callApi(authCtrl, {
+      method: 'OPTIONS',
+      url: '/__soul-sync/api/state',
+      headers: { host: '127.0.0.1:3080', origin: 'dsh-app://app' },
+    });
+    assert.equal(unauthOpt.status, 401, 'Neon P2 #6: OPTIONS without auth cookie must return 401 before 204');
+    const authOpt = await callApi(authCtrl, {
+      method: 'OPTIONS',
+      url: '/__soul-sync/api/state',
+      headers: { host: '127.0.0.1:3080', origin: 'dsh-app://app', cookie: 'dsh_auth=valid' },
+    });
+    assert.equal(authOpt.status, 204);
+    assert.equal(authOpt.headers['access-control-allow-origin'], undefined, 'Neon P2 #6: OPTIONS must NOT reflect Access-Control-Allow-Origin: dsh-app://app');
+  } finally {
+    await authCtrl?.dispose?.();
+    await legWinCtrl?.dispose?.();
+    await legMacCtrl?.dispose?.();
+    await winCtrl.dispose();
+    await macCtrl.dispose();
+  }
 });
