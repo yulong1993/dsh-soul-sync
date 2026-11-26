@@ -26,6 +26,7 @@ import {
   shouldAutoSyncSession,
 } from '../lib/session-plane.js';
 import {
+  recordDeliverableCandidate,
   pushWorkspaceDeliverables,
   pullWorkspaceDeliverables,
   loadWorkspaceDeliverableState,
@@ -987,6 +988,8 @@ test('Re-audit regressions: dual-selected pullAll reply roundtrip, unpublish LWW
       { type: 'session', version: 4, id: 'sess-mac-bad', createdAt: 1200, cwd: macWs, isSeeded: false, delegationDepth: 0 },
       [{ seq: 0, time: 1300, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Mac错口令期间对话' }] } }],
     );
+    await fs.mkdir(path.join(macWs, 'outputs'), { recursive: true });
+    await fs.writeFile(path.join(macWs, 'outputs', 'mac-wrong.md'), '# Written under wrong passphrase\n', 'utf8');
 
     const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
     const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', minQuietMs: 0, pollIntervalMs: 0 });
@@ -994,17 +997,19 @@ test('Re-audit regressions: dual-selected pullAll reply roundtrip, unpublish LWW
       await winCtrl.reloadConfig();
       await winCtrl.pushAll();
 
-      // Mac starts with WRONG passphrase AND writes wrong-key session + global commits
+      // Mac starts with WRONG passphrase AND writes wrong-key session + workspace deliverable + global commits
       await macCtrl.start();
       await macCtrl.pushAll();
-      assert.equal(macCtrl._seenRemoteCommitFiles.size, 0, '_runStartup must NOT swallow undecryptable remote commits into _seenRemoteCommitFiles');
+      // Steady-state wrong passphrase must NOT cause repeated 15s full-pull loops
+      const badSteadyPoll = await macCtrl._pollTick();
+      assert.equal(badSteadyPoll.pulled, false);
 
       // Win currently sees Mac's undecryptable commits
       const winBadState = await callApi(winCtrl, { method: 'GET', url: '/__soul-sync/api/state', headers: { 'x-dsh-soul-sync': '1' } });
       assert.ok(winBadState.json.decryptionFailedCount > 0, 'Win should detect Mac wrong-key commits before recovery');
       assert.ok(winBadState.json.decryptionFailedDevices['mac-rec'] > 0, 'decryptionFailedDevices should attribute mac-rec');
 
-      // Mac fixes passphrase via updateSettings -> purges obsolete own wrong-key commits, re-publishes & syncs!
+      // Mac fixes passphrase via updateSettings -> purges obsolete own wrong-key commits, re-uploads workspace deliverables & syncs!
       await macCtrl.updateSettings({ passphrase: 'true-pass-2026' });
 
       // Win now sees decryptionFailedCount === 0 AND pruneHistory runs blob GC cleanly (skippedBlobGc === false)!
@@ -1013,12 +1018,244 @@ test('Re-audit regressions: dual-selected pullAll reply roundtrip, unpublish LWW
       const pruneRes = await winCtrl.vault.pruneHistory('session', 5);
       assert.equal(pruneRes.skippedBlobGc, false, 'Vault orphan blob GC must resume cleanly after wrong-key own commits purged');
 
-      // Mac has pulled Win's session AND _pollTick sees unconsumed files cleanly
+      // P1-NEW-1: Mac adds a second deliverable and pushes -> Win pulls BOTH mac-wrong.md and mac-good2.md with ZERO pending-hydration!
+      await fs.writeFile(path.join(macWs, 'outputs', 'mac-good2.md'), '# Written after fix\n', 'utf8');
+      await macCtrl.pushAll();
+      const winPullAfterFix = await winCtrl.pullAll();
+      assert.equal(winPullAfterFix.ok, true);
+      assert.equal(winPullAfterFix.workspaces[0].status, 'synced', 'Win workspace pull must NOT stall with pending-hydration');
+      assert.equal(await fs.readFile(path.join(winWs, 'outputs', 'mac-wrong.md'), 'utf8'), '# Written under wrong passphrase\n');
+      assert.equal(await fs.readFile(path.join(winWs, 'outputs', 'mac-good2.md'), 'utf8'), '# Written after fix\n');
+
+      // Mac has pulled Win's session AND _pollTick sees unconsumed files cleanly (until marked seen)
       const pollRes = await macCtrl._pollTick();
       assert.equal(pollRes.polled, true);
       assert.equal(pollRes.pulled, true);
       const macSessions = await scanLocalSessions(macHome);
       assert.ok(macSessions.has('sess-win-true'), 'Mac must have pulled Win session after passphrase fix');
+    } finally {
+      await winCtrl.dispose();
+      await macCtrl.dispose();
+    }
+  }
+});
+
+test('Round-2 regressions: Probe K1 (established device typo passphrase preservation), P1-NEW-2 (encrypted auto-mirror -> mapped storageKey), and mapped-only _pollTick steady state', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'round2-regressions');
+
+  // --- Probe K1 (Opus P1-C): Established Win (30 sessions + mapped workspace) mistypes passphrase then restores it ---
+  {
+    const subDir = path.join(caseDir, 'probe-k1');
+    const winHome = path.join(subDir, 'win-home');
+    const macHome = path.join(subDir, 'mac-home');
+    const vaultDir = path.join(subDir, 'vault');
+    const winWs = path.join(subDir, 'win-ws');
+    const macWs = path.join(subDir, 'mac-ws');
+    await fs.mkdir(path.join(winWs, 'outputs'), { recursive: true });
+    await fs.mkdir(macWs, { recursive: true });
+    await fs.mkdir(vaultDir, { recursive: true });
+
+    const mappings = [{ id: 'k1-proj', title: 'K1Proj', win32: winWs, darwin: macWs, linux: macWs }];
+    await savePassphraseKey(winHome, 'real-k1-pass');
+    await savePassphraseKey(macHome, 'real-k1-pass');
+    await saveConfig(winHome, {
+      deviceId: 'win-k1',
+      deviceLabel: 'WinK1',
+      platform: 'win32',
+      vaultDir,
+      encryptionEnabled: true,
+      workspaceMappings: mappings,
+    });
+    await saveConfig(macHome, {
+      deviceId: 'mac-k1',
+      deviceLabel: 'MacK1',
+      platform: 'darwin',
+      vaultDir,
+      encryptionEnabled: true,
+      workspaceMappings: mappings,
+    });
+
+    // Write 30 sessions on Win (25 auto-pushed via pushAll + 5 older pushed explicitly via pushSelected)
+    const now = Date.now();
+    for (let i = 1; i <= 30; i += 1) {
+      const ts = now - (31 - i) * 1000;
+      await writeLocalSession(
+        winHome,
+        { type: 'session', version: 4, id: `sess-k1-${String(i).padStart(2, '0')}`, createdAt: ts, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+        [{ seq: 0, time: ts + 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `K1对话 #${i}` }] } }],
+      );
+    }
+    await fs.writeFile(path.join(winWs, 'model.py'), 'print("valuation v1")\n', 'utf8');
+    await fs.writeFile(path.join(winWs, 'outputs', 'a.md'), '# Analysis v1\n', 'utf8');
+    await recordDeliverableCandidate(winHome, 'k1-proj', winWs, 'model.py', 'manual');
+
+    const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
+    const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', minQuietMs: 0, pollIntervalMs: 0 });
+    try {
+      await winCtrl.reloadConfig();
+      await macCtrl.reloadConfig();
+
+      await winCtrl.pushAll();
+      await winCtrl.pushSelected({ sessionIds: ['sess-k1-01', 'sess-k1-02', 'sess-k1-03', 'sess-k1-04', 'sess-k1-05'] });
+      const beforeCatalog = await macCtrl.listVaultCatalog();
+      assert.equal(beforeCatalog.totalSessions, 30, 'All 30 sessions must exist in vault before typo');
+
+      // Win mistypes passphrase in panel, then restores right passphrase!
+      await winCtrl.updateSettings({ passphrase: 'mistyped-pass-oops' });
+      await winCtrl.updateSettings({ passphrase: 'real-k1-pass' });
+
+      // All 30 sessions AND workspace deliverables must survive 100% intact!
+      const afterCatalog = await macCtrl.listVaultCatalog();
+      assert.equal(afterCatalog.totalSessions, 30, 'Typo passphrase must NEVER wipe established vault history');
+      assert.equal(afterCatalog.decryptionFailedCount, 0);
+
+      const macPull1 = await macCtrl.pullAll();
+      assert.equal(macPull1.sessions.summary.imported, 30);
+      assert.equal(macPull1.workspaces[0].status, 'synced');
+      assert.equal(await fs.readFile(path.join(macWs, 'model.py'), 'utf8'), 'print("valuation v1")\n');
+      assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'a.md'), 'utf8'), '# Analysis v1\n');
+
+      // Win edits a.md and pushes -> Mac pulls cleanly with ZERO pending-hydration!
+      await fs.writeFile(path.join(winWs, 'outputs', 'a.md'), '# Analysis v2\n', 'utf8');
+      await winCtrl.pushAll();
+      const macPull2 = await macCtrl.pullAll();
+      assert.equal(macPull2.workspaces[0].status, 'synced');
+      assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'a.md'), 'utf8'), '# Analysis v2\n');
+    } finally {
+      await winCtrl.dispose();
+      await macCtrl.dispose();
+    }
+  }
+
+  // --- Probe P1-NEW-2 (Neon): Encrypted auto-mirror outputs/report.md promoted to explicit mapping ---
+  {
+    const subDir = path.join(caseDir, 'probe-p1-new-2');
+    const winHome = path.join(subDir, 'win-home');
+    const macHome = path.join(subDir, 'mac-home');
+    const vaultDir = path.join(subDir, 'vault');
+    const winWs = path.join(subDir, 'win-alpha');
+    const macMirrors = path.join(subDir, 'mac-mirrors');
+    const macWs = path.join(macMirrors, 'win-alpha');
+    await fs.mkdir(path.join(winWs, 'outputs'), { recursive: true });
+    await fs.mkdir(vaultDir, { recursive: true });
+
+    await savePassphraseKey(winHome, 'shared-valid-pass');
+    await savePassphraseKey(macHome, 'shared-valid-pass');
+    await saveConfig(winHome, {
+      deviceId: 'win-p1n2',
+      deviceLabel: 'WinP1N2',
+      platform: 'win32',
+      vaultDir,
+      encryptionEnabled: true,
+    });
+    await saveConfig(macHome, {
+      deviceId: 'mac-p1n2',
+      deviceLabel: 'MacP1N2',
+      platform: process.platform,
+      vaultDir,
+      encryptionEnabled: true,
+      autoMirrorRoot: macMirrors,
+    });
+
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: 'sess-p1n2-1', createdAt: 1000, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '带outputs的镜像会话' }] } }],
+    );
+    await fs.writeFile(path.join(winWs, 'outputs', 'report.md'), '# Initial Auto-Mirror Report\n', 'utf8');
+
+    const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
+    const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: process.platform, minQuietMs: 0, pollIntervalMs: 0 });
+    try {
+      await winCtrl.reloadConfig();
+      await macCtrl.reloadConfig();
+
+      // 1. Auto-mirror phase: Win pushes unmapped session with outputs/report.md -> Mac pulls (writes session-outputs-state.json)
+      await winCtrl.pushAll();
+      const macAutoPull = await macCtrl.pullAll();
+      assert.equal(macAutoPull.sessions.summary.imported, 1);
+      assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), '# Initial Auto-Mirror Report\n');
+
+      // 2. Promote workspace to explicit Win<->Mac mapping on both machines
+      const promoted = [{ id: 'alpha-mapped', title: 'Alpha', win32: winWs, darwin: macWs, linux: macWs, updatedAt: Date.now() }];
+      await saveConfig(winHome, { workspaceMappings: promoted });
+      await saveConfig(macHome, { platform: 'darwin', workspaceMappings: promoted });
+      macCtrl.platform = 'darwin';
+      await winCtrl.reloadConfig();
+      await macCtrl.reloadConfig();
+
+      // 3. Win adds outputs/from-win-2.md & pushes -> Mac pulls (seeds baseTree with storageKey: null!)
+      await fs.writeFile(path.join(winWs, 'outputs', 'from-win-2.md'), '# From Win 2\n', 'utf8');
+      await winCtrl.pushAll();
+      const macPromotedPull = await macCtrl.pullAll();
+      assert.equal(macPromotedPull.workspaces[0].status, 'synced');
+      assert.equal(macPromotedPull.workspaces[0].conflicts.length, 0);
+
+      // Verify seeded baseTree entry did NOT store plaintext sha256 as storageKey
+      const macState = await loadWorkspaceDeliverableState(macHome, 'alpha-mapped');
+      assert.notEqual(
+        macState.baseTree['outputs/report.md']?.storageKey,
+        macState.baseTree['outputs/report.md']?.sha256,
+        'Encrypted workspace baseTree must never store plaintext sha256 as storageKey',
+      );
+
+      // 4. Mac adds outputs/new-from-mac.md & pushes -> pushWorkspaceDeliverables MUST putBlob valid HMAC storageKey for report.md!
+      await fs.writeFile(path.join(macWs, 'outputs', 'new-from-mac.md'), '# New From Mac\n', 'utf8');
+      await macCtrl.pushAll();
+
+      // 5. Win pulls -> MUST receive BOTH files cleanly with ZERO pending-hydration!
+      const winPull = await winCtrl.pullAll();
+      assert.equal(winPull.workspaces[0].status, 'synced', 'Win pull must NOT deadlock on plaintext-sha256 storageKey');
+      assert.equal(await fs.readFile(path.join(winWs, 'outputs', 'report.md'), 'utf8'), '# Initial Auto-Mirror Report\n');
+      assert.equal(await fs.readFile(path.join(winWs, 'outputs', 'new-from-mac.md'), 'utf8'), '# New From Mac\n');
+    } finally {
+      await winCtrl.dispose();
+      await macCtrl.dispose();
+    }
+  }
+
+  // --- Probe P2: _pollTick steady-state in mapped-only mode with unmapped remote session (no 15s infinite loop) ---
+  {
+    const subDir = path.join(caseDir, 'probe-poll-steady');
+    const winHome = path.join(subDir, 'win-home');
+    const macHome = path.join(subDir, 'mac-home');
+    const vaultDir = path.join(subDir, 'vault');
+    const winUnmappedWs = path.join(subDir, 'win-unmapped');
+    await fs.mkdir(winUnmappedWs, { recursive: true });
+    await fs.mkdir(vaultDir, { recursive: true });
+
+    await saveConfig(winHome, { deviceId: 'win-poll', deviceLabel: 'WinPoll', platform: 'win32', vaultDir });
+    await saveConfig(macHome, {
+      deviceId: 'mac-poll',
+      deviceLabel: 'MacPoll',
+      platform: 'darwin',
+      vaultDir,
+      folderMatchMode: 'mapped-only',
+    });
+
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: 'sess-unmapped-poll', createdAt: 1000, cwd: winUnmappedWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '未映射对话' }] } }],
+    );
+
+    const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
+    const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', minQuietMs: 0, pollIntervalMs: 0 });
+    try {
+      await winCtrl.reloadConfig();
+      await macCtrl.reloadConfig();
+      await winCtrl.pushAll();
+
+      // Tick 1 pulls and records seen commits even though skippedUnmapped === 1
+      const tick1 = await macCtrl._pollTick();
+      assert.equal(tick1.polled, true);
+      assert.equal(tick1.pulled, true);
+      assert.equal(tick1.result.sessions.summary.skippedUnmapped, 1);
+
+      // Tick 2 MUST return pulled: false (no 15s repeated full-pull loop!)
+      const tick2 = await macCtrl._pollTick();
+      assert.equal(tick2.polled, true);
+      assert.equal(tick2.pulled, false, 'Second _pollTick must not loop on stable skippedUnmapped commits');
     } finally {
       await winCtrl.dispose();
       await macCtrl.dispose();
