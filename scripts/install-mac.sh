@@ -72,6 +72,9 @@ if [ ! -f "$CLI_ENTRY" ]; then
 fi
 
 DSH_APP="/Applications/DeepSeek Harness.app"
+if [ ! -e "$DSH_APP/Contents/Resources/app.asar" ] && [ -e "$HOME/Applications/DeepSeek Harness.app/Contents/Resources/app.asar" ]; then
+  DSH_APP="$HOME/Applications/DeepSeek Harness.app"
+fi
 DSH_ELECTRON="$DSH_APP/Contents/MacOS/DeepSeek Harness"
 DSH_ASAR="$DSH_APP/Contents/Resources/app.asar"
 DSH_HOST_CLI="$DSH_ASAR/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js"
@@ -94,7 +97,7 @@ if [ -x "$DSH_ELECTRON" ] && [ -e "$DSH_ASAR" ]; then
 elif command -v dsh >/dev/null 2>&1; then
   FALLBACK_DSH="$(command -v dsh)"
 else
-  echo "未检测到 /Applications/DeepSeek Harness.app 或 dsh 命令。" >&2
+  echo "未检测到 /Applications/DeepSeek Harness.app、\$HOME/Applications/DeepSeek Harness.app 或 dsh 命令。" >&2
   exit 1
 fi
 

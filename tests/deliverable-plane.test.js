@@ -24,6 +24,7 @@ const execFile = promisify(execFileCb);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const TEST_TMP_ROOT = path.join(REPO_ROOT, '.test-tmp', `deliverable-plane-${process.pid}-${Date.now()}`);
+const PART_B_TMP_ROOT = path.join(REPO_ROOT, '.test-tmp', `part-b-deliverable-${process.pid}-${Date.now()}`);
 
 function sha256Hex(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
@@ -102,10 +103,12 @@ async function waitForCondition(predicate, timeoutMs = 4000, intervalMs = 50) {
 
 test.before(async () => {
   await fs.mkdir(TEST_TMP_ROOT, { recursive: true });
+  await fs.mkdir(PART_B_TMP_ROOT, { recursive: true });
 });
 
 test.after(async () => {
   await fs.rm(TEST_TMP_ROOT, { recursive: true, force: true });
+  await fs.rm(PART_B_TMP_ROOT, { recursive: true, force: true });
 });
 
 test.describe('deliverable-plane: 4-signal provenance ledger & Git exclusion', () => {
@@ -736,5 +739,297 @@ test.describe('deliverable-plane: 3-way merge conflicts, idempotency, soft-delet
       'symlink-escaped',
     );
     await assert.rejects(fs.stat(path.join(outsideDir, 'a_small.txt')));
+  });
+});
+
+test.describe('deliverable-plane: Opus C5 roundtrip preservation & C7 workspaceRoot repoint guard', () => {
+  test('C5: preserves first-pusher local version on 3-way merge roundtrip, excludes conflict copies from vault, and settles idempotently with zero ping-pong', async () => {
+    const baseDir = path.join(PART_B_TMP_ROOT, 'c5-roundtrip');
+    const winHome = path.join(baseDir, 'win-home');
+    const macHome = path.join(baseDir, 'mac-home');
+    const vaultDir = path.join(baseDir, 'vault');
+    const winWs = path.join(baseDir, 'win-ws');
+    const macWs = path.join(baseDir, 'mac-ws');
+    await fs.mkdir(winWs, { recursive: true });
+    await fs.mkdir(macWs, { recursive: true });
+
+    const winVault = new VaultStore({ vaultDir, deviceId: 'win-office', platform: 'win32' });
+    const macVault = new VaultStore({ vaultDir, deviceId: 'mac-air', platform: 'darwin' });
+
+    // Base state synced to both Win and Mac
+    await writeFileEnsuringDir(path.join(winWs, 'outputs', 'report.md'), 'BASE-CONTENT\n');
+    await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: winWs,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    const macBasePull = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macBasePull.status, 'synced');
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), 'BASE-CONTENT\n');
+
+    // Both machines edit outputs/report.md offline; also plant a *.conflict-* file that must NEVER be synced
+    const winContent = 'WIN-EDIT\n';
+    const macContent = 'MAC-EDIT\n';
+    const winSha = sha256Hex(Buffer.from(winContent, 'utf8'));
+    await fs.writeFile(path.join(winWs, 'outputs', 'report.md'), winContent);
+    await writeFileEnsuringDir(path.join(winWs, 'outputs', 'report.conflict-old-1234abcd.md'), 'OLD-CONFLICT\n');
+    await fs.writeFile(path.join(macWs, 'outputs', 'report.md'), macContent);
+
+    // 1) Win pushes first
+    const winPush1 = await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: winWs,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    assert.equal(winPush1.published, true);
+    assert.equal(winPush1.tree['outputs/report.conflict-old-1234abcd.md'], undefined, '*.conflict-* files must never be uploaded');
+
+    // 2) Mac pulls -> Rule 3 keeps MAC-EDIT on Mac and creates Win conflict copy
+    const macPull1 = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: macWs,
+    });
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), macContent);
+    assert.equal(macPull1.conflicts.length, 1);
+    assert.equal(macPull1.conflicts[0].path, 'outputs/report.md');
+    const macConflictPath = macPull1.conflicts[0].conflictPath;
+    assert.equal(await fs.readFile(path.join(macWs, ...macConflictPath.split('/')), 'utf8'), winContent);
+
+    // 3) Mac pushes -> publishes MAC-EDIT with conflictOverriddenSha === winSha, and EXCLUDES Mac's conflict copy!
+    const macPush1 = await pushWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: macWs,
+      deviceLabel: 'mac-air',
+      minQuietMs: 0,
+    });
+    assert.equal(macPush1.published, true);
+    assert.equal(macPush1.tree[macConflictPath], undefined, 'Conflict copy must never be packed into vault manifest');
+    assert.equal(macPush1.tree['outputs/report.md'].conflictOverriddenSha, winSha);
+    assert.ok(macPush1.tree['outputs/report.md'].conflictOverriddenShas.includes(winSha));
+
+    // 4) Win pulls Mac's commit -> MUST keep WIN-EDIT intact in Win/outputs/report.md,
+    //    write MAC-EDIT as a conflict copy on Win, and return it in conflicts!
+    const winPull1 = await pullWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: winWs,
+    });
+    assert.equal(
+      await fs.readFile(path.join(winWs, 'outputs', 'report.md'), 'utf8'),
+      winContent,
+      'First pusher (Win) MUST keep WIN-EDIT intact in outputs/report.md!',
+    );
+    assert.equal(winPull1.conflicts.length, 1, 'Win must receive a clear conflict alert too');
+    assert.equal(winPull1.conflicts[0].path, 'outputs/report.md');
+    assert.equal(winPull1.conflicts[0].kind, 'both-modified');
+    const winConflictPath = winPull1.conflicts[0].conflictPath;
+    assert.equal(await fs.readFile(path.join(winWs, ...winConflictPath.split('/')), 'utf8'), macContent);
+
+    // 5) Settlement check (zero infinite ping-pong): Win push -> Mac pull -> Win pull -> Mac push
+    const winPushSettle = await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: winWs,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    assert.equal(winPushSettle.published, false, 'Win must NOT re-push unchanged WIN-EDIT (no ping-pong)');
+
+    const macPullSettle = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPullSettle.status, 'up-to-date');
+    assert.equal(macPullSettle.conflicts.length, 0);
+
+    const winPullSettle = await pullWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: winWs,
+    });
+    assert.equal(winPullSettle.status, 'up-to-date');
+    assert.equal(winPullSettle.conflicts.length, 0);
+
+    const macPushSettle = await pushWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: macWs,
+      deviceLabel: 'mac-air',
+      minQuietMs: 0,
+    });
+    assert.equal(macPushSettle.published, false, 'Mac must NOT re-push unchanged MAC-EDIT');
+
+    // 6) Unrelated edit on Win must NOT clobber MAC-EDIT on Mac
+    await writeFileEnsuringDir(path.join(winWs, 'outputs', 'notes.md'), 'UNRELATED-NOTE\n');
+    const winPushOther = await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: winWs,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    assert.equal(winPushOther.published, true);
+
+    const macPullOther = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPullOther.conflicts.length, 0);
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'notes.md'), 'utf8'), 'UNRELATED-NOTE\n');
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), macContent);
+
+    // 7) Once Win user manually resolves conflict and saves a new merged version, Mac cleanly fast-forwards
+    await fs.writeFile(path.join(winWs, 'outputs', 'report.md'), 'MERGED-FINAL\n');
+    const winPushResolved = await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: winWs,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    assert.equal(winPushResolved.published, true);
+    assert.equal(winPushResolved.tree['outputs/report.md'].conflictOverriddenSha, undefined);
+
+    const macPullResolved = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c5',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPullResolved.conflicts.length, 0);
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), 'MERGED-FINAL\n');
+  });
+
+  test('C7: repointing workspaceId to a new/empty root resets state and never emits false deletion tombstones into peer trash', async () => {
+    const baseDir = path.join(PART_B_TMP_ROOT, 'c7-repoint-root');
+    const winHome = path.join(baseDir, 'win-home');
+    const macHome = path.join(baseDir, 'mac-home');
+    const vaultDir = path.join(baseDir, 'vault');
+    const winWsA = path.join(baseDir, 'win-ws-a');
+    const winWsB = path.join(baseDir, 'win-ws-b-empty');
+    const macWs = path.join(baseDir, 'mac-ws');
+    const macWsB = path.join(baseDir, 'mac-ws-b-repointed');
+    await fs.mkdir(winWsA, { recursive: true });
+    await fs.mkdir(winWsB, { recursive: true });
+    await fs.mkdir(macWs, { recursive: true });
+    await fs.mkdir(macWsB, { recursive: true });
+
+    const winVault = new VaultStore({ vaultDir, deviceId: 'win-office', platform: 'win32' });
+    const macVault = new VaultStore({ vaultDir, deviceId: 'mac-air', platform: 'darwin' });
+
+    // Initial sync from winWsA -> macWs
+    await writeFileEnsuringDir(path.join(winWsA, 'outputs', 'report.md'), 'IMPORTANT-REPORT\n');
+    await writeFileEnsuringDir(path.join(winWsA, 'outputs', 'model.csv'), 'a,b\n1,2\n');
+    const pushA = await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c7',
+      workspaceRoot: winWsA,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    assert.equal(pushA.published, true);
+    const stateA = await loadWorkspaceDeliverableState(winHome, 'ws-c7');
+    assert.ok(stateA.workspaceRoot.length > 0, 'workspaceRoot must be persisted in workspace state');
+
+    const macPull1 = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c7',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPull1.status, 'synced');
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), 'IMPORTANT-REPORT\n');
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'model.csv'), 'utf8'), 'a,b\n1,2\n');
+
+    // Repoint Win's ws-c7 to a brand-new empty directory winWsB and push
+    const pushRepointedEmpty = await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c7',
+      workspaceRoot: winWsB,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    assert.equal(pushRepointedEmpty.published, false, 'Empty repointed root must NOT publish deletion tombstones');
+    assert.deepEqual(pushRepointedEmpty.deleted, []);
+    assert.deepEqual(pushRepointedEmpty.tree, {});
+
+    const stateB = await loadWorkspaceDeliverableState(winHome, 'ws-c7');
+    assert.notEqual(stateB.workspaceRoot, stateA.workspaceRoot);
+    assert.deepEqual(stateB.baseTree, {});
+    assert.deepEqual(stateB.lastPublishedTree, {});
+    assert.equal(stateB.hasPublished, false);
+
+    // Mac pulls -> ZERO files moved to trash, all Mac files intact!
+    const macPullAfterRepoint = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c7',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPullAfterRepoint.trashed.length, 0);
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), 'IMPORTANT-REPORT\n');
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'model.csv'), 'utf8'), 'a,b\n1,2\n');
+
+    // Adding a brand-new file in winWsB pushes ONLY that new file (no tombstones for winWsA files!)
+    await writeFileEnsuringDir(path.join(winWsB, 'outputs', 'fresh.md'), 'NEW-IN-B\n');
+    const pushFresh = await pushWorkspaceDeliverables({
+      dshHome: winHome,
+      vault: winVault,
+      workspaceId: 'ws-c7',
+      workspaceRoot: winWsB,
+      deviceLabel: 'win-office',
+      minQuietMs: 0,
+    });
+    assert.equal(pushFresh.published, true);
+    assert.deepEqual(pushFresh.deleted, []);
+    assert.deepEqual(Object.keys(pushFresh.tree), ['outputs/fresh.md']);
+
+    const macPullFresh = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c7',
+      workspaceRoot: macWs,
+    });
+    assert.equal(macPullFresh.trashed.length, 0);
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'fresh.md'), 'utf8'), 'NEW-IN-B\n');
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'report.md'), 'utf8'), 'IMPORTANT-REPORT\n');
+    assert.equal(await fs.readFile(path.join(macWs, 'outputs', 'model.csv'), 'utf8'), 'a,b\n1,2\n');
+
+    // Repointing Mac to a new empty folder macWsB resets lastPulledCommits and hydrates cleanly from vault
+    const macPullRepointed = await pullWorkspaceDeliverables({
+      dshHome: macHome,
+      vault: macVault,
+      workspaceId: 'ws-c7',
+      workspaceRoot: macWsB,
+    });
+    assert.equal(macPullRepointed.status, 'synced');
+    assert.equal(await fs.readFile(path.join(macWsB, 'outputs', 'fresh.md'), 'utf8'), 'NEW-IN-B\n');
   });
 });

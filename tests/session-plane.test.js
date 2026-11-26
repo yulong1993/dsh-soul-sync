@@ -330,8 +330,12 @@ test.describe('session-plane: cross-OS lineage export/import, minimal rewrite & 
     assert.ok(allAccountedSessions.includes(rootId), 'root session must be registered in workspace.json');
     assert.equal(allAccountedSessions.includes(childId), false, 'subagent must NOT be mixed into top-level workspace sessionIds');
 
-    // Verify stale session_projcache was deleted
-    await assert.rejects(() => fs.stat(staleCachePath), { code: 'ENOENT' });
+    // Verify stale session_projcache was replaced with a warmed v7 projection checkpoint (P0-1)
+    const warmedCache = JSON.parse(await fs.readFile(staleCachePath, 'utf8'));
+    assert.equal(warmedCache.stale, undefined, 'Stale cache payload must be overwritten');
+    assert.equal(warmedCache.version, 7);
+    assert.equal(warmedCache.record.rows.sessionListMetadata.val.blank, false);
+    assert.ok(warmedCache.record.rows.sessionListMetadata.val.lastPromptAt > 0);
 
     // Verify pending-migrations.json recorded and consumePendingMigration consumes once
     const pendingBefore = await readPendingMigrations(macHome);

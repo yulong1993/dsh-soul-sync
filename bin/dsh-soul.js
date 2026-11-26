@@ -25,7 +25,8 @@ import {
   extractDirBasename,
   deriveWorkspaceId,
 } from '../lib/config.js';
-import { scanLocalSessions, pullSessionsFromVault, exportAllLocalSessions } from '../lib/session-plane.js';
+import { scanLocalSessions } from '../lib/session-plane.js';
+import { VaultStore } from '../lib/crypto-vault.js';
 import {
   recordDeliverableCandidate,
   pushWorkspaceDeliverables,
@@ -120,17 +121,44 @@ export function parseWorkspaceMappingSpec(rawSpec) {
   };
 }
 
+function normPathCmp(p) {
+  return String(p ?? '').trim().normalize('NFC').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
 function mergeWorkspaceMappings(existingList, additions) {
-  const byId = new Map();
-  for (const m of existingList ?? []) {
-    if (m?.id) byId.set(m.id, { ...m });
-  }
+  const result = (existingList ?? []).filter((m) => m?.id).map((m) => ({ ...m }));
   for (const m of additions ?? []) {
     if (!m?.id) continue;
-    const prev = byId.get(m.id) ?? {};
-    byId.set(m.id, { ...prev, ...m });
+    // C9: Match existing entry by exact id (only if paths don't conflict) or by matching win32/darwin path.
+    // Two distinct path pairs sharing a basename NEVER silently overwrite each other!
+    let idx = result.findIndex(
+      (em) =>
+        (m.win32 && em.win32 && normPathCmp(m.win32) === normPathCmp(em.win32))
+        || (m.darwin && em.darwin && normPathCmp(m.darwin) === normPathCmp(em.darwin)),
+    );
+    if (idx === -1) {
+      idx = result.findIndex((em) => em.id === m.id);
+      if (idx !== -1) {
+        const em = result[idx];
+        const winDiff = Boolean(m.win32 && em.win32 && normPathCmp(m.win32) !== normPathCmp(em.win32));
+        const macDiff = Boolean(m.darwin && em.darwin && normPathCmp(m.darwin) !== normPathCmp(em.darwin));
+        if (winDiff || macDiff) {
+          const disambigId = deriveWorkspaceId(m.win32 || '', m.darwin || '');
+          const uniqueId = result.some((x) => x.id === disambigId)
+            ? `${disambigId}-${crypto.createHash('sha256').update(`${normPathCmp(m.win32)}|${normPathCmp(m.darwin)}|${result.length}`).digest('hex').slice(0, 4)}`
+            : disambigId;
+          result.push({ ...m, id: uniqueId });
+          continue;
+        }
+      }
+    }
+    if (idx !== -1) {
+      result[idx] = { ...result[idx], ...m, id: result[idx].id };
+    } else {
+      result.push({ ...m });
+    }
   }
-  return [...byId.values()];
+  return result;
 }
 
 function parseArgv(argv) {
@@ -600,41 +628,16 @@ async function runPush(flags, dshHome, io) {
     return 0;
   }
 
-  const globalRes = await controller.syncGlobalAgentsMd();
-  const sessRes = await exportAllLocalSessions({
-    dshHome,
-    vault: controller.vault,
-    workspaceMappings: controller.config.workspaceMappings,
-    deviceLabel: controller.config.deviceLabel,
-    syncScope: controller.config.syncScope,
-    folderMatchMode: controller.config.folderMatchMode,
-    selectedWorkspaces: controller.config.selectedWorkspaces,
-    selectedSessionIds: controller.config.selectedSessionIds,
-    excludedSessionIds: controller.config.excludedSessionIds,
-    sessionTargetOverrides: controller.config.sessionTargetOverrides,
-    workspaceTargetOverrides: controller.config.workspaceTargetOverrides,
-    maxAutoSessionsPerWorkspace: controller.config.quotas?.maxAutoSessionsPerWorkspace ?? DEFAULT_QUOTAS.maxAutoSessionsPerWorkspace,
-    platform: io.platform,
-  });
-
-  const pushedIds = new Set();
-  const wsResults = [];
-
-  for (const mapping of controller.config.workspaceMappings ?? []) {
-    const localRoot = mapping[io.platform];
-    if (!localRoot || !(await pathExists(localRoot))) continue;
-    pushedIds.add(mapping.id);
-    const res = await pushWorkspaceDeliverables({
-      dshHome,
-      vault: controller.vault,
-      workspaceId: mapping.id,
-      workspaceRoot: localRoot,
-      deviceLabel: controller.config.deviceLabel,
-      minQuietMs: io.minQuietMs ?? 0,
-      quotas: controller.config.quotas,
-    });
-    wsResults.push({ id: mapping.id, title: mapping.title, ...res });
+  // P1-2: Delegate non-selective push through SoulSyncController.pushAll() so CLI strictly enforces
+  // `syncScope: 'selected'`, `excludedSessionIds`, `withdrawnSessions`, and encrypted workspace-mappings!
+  const pushRes = await controller.pushAll();
+  if (!pushRes.ok) {
+    io.err(`推送失败：${pushRes.reason || '未知错误'}`);
+    return 1;
   }
+
+  const wsResults = [...(pushRes.workspaces ?? [])];
+  const pushedIds = new Set(wsResults.map((w) => w.workspaceId ?? w.id).filter(Boolean));
 
   if (flags.workspace) {
     const resolvedWs = path.resolve(flags.workspace);
@@ -658,13 +661,6 @@ async function runPush(flags, dshHome, io) {
     }
   }
 
-  controller._lastBackupAt = Date.now();
-  await controller.updateHeartbeat({ status: 'active' });
-
-  const keepN = controller.config.quotas?.retainSnapshots ?? DEFAULT_QUOTAS.retainSnapshots;
-  await controller.vault.pruneHistory('session', keepN).catch(() => {});
-  await controller.vault.pruneHistory('workspace', keepN).catch(() => {});
-
   const totalUploaded = wsResults.reduce((sum, w) => sum + w.uploaded.length, 0);
   const totalDeleted = wsResults.reduce((sum, w) => sum + w.deleted.length, 0);
   const totalDeferred = wsResults.reduce((sum, w) => sum + w.deferred.length, 0);
@@ -672,11 +668,12 @@ async function runPush(flags, dshHome, io) {
   const openLocks = wsResults.flatMap((w) => w.openLocks ?? []);
 
   io.out(
-    `推送完成：会话闭包 ${sessRes.exported.length} 个（AGENTS.md ${globalRes.published ? '已更新' : '无变化'}）；工作区产出上传 ${totalUploaded} / 删除 ${totalDeleted} / 延后 ${totalDeferred} / 拦截 ${totalBlocked}。`,
+    `推送完成：会话闭包 ${pushRes.sessionPushedCount} 个（AGENTS.md ${pushRes.global?.published ? '已更新' : '无变化'}）；工作区产出上传 ${totalUploaded} / 删除 ${totalDeleted} / 延后 ${totalDeferred} / 拦截 ${totalBlocked}。`,
   );
   if (openLocks.length > 0) {
     io.out(`⚠️ 检测到未关闭的 Office 锁文件：${openLocks.map((l) => l.lockPath).join('、')}`);
   }
+  await controller.dispose();
   return 0;
 }
 
@@ -747,50 +744,22 @@ async function runPull(flags, dshHome, io) {
     return 0;
   }
 
-  const globalRes = await controller.syncGlobalAgentsMd();
-
-  let sessionSummary = { imported: 0, fastForwarded: 0, forkedBranches: 0, upToDate: 0 };
-  if (!skipSessions) {
-    const sessRes = await pullSessionsFromVault({
-      dshHome,
-      vault: controller.vault,
-      workspaceMappings: controller.config.workspaceMappings,
-      targetPlatform: io.platform,
-      fallbackRoot: controller.config.fallbackDir || undefined,
-      folderMatchMode: controller.config.folderMatchMode,
-      autoMirrorRoot: controller.config.autoMirrorRoot || undefined,
-      syncScope: controller.config.syncScope,
-      selectedWorkspaces: controller.config.selectedWorkspaces,
-      selectedSessionIds: controller.config.selectedSessionIds,
-      excludedSessionIds: controller.config.excludedSessionIds,
-      sessionTargetOverrides: controller.config.sessionTargetOverrides,
-      workspaceTargetOverrides: { ...(controller.config.workspaceTargetOverrides ?? {}), ...targetOverrides },
-    });
-    sessionSummary = sessRes.summary;
+  // P1-2: Delegate non-selective pull through SoulSyncController.pullAll() so disaster recovery
+  // receives encrypted cross-device `workspace-mappings`, `withdrawnSessions`, and persists `autoMirrorAssignments`!
+  const pullRes = await controller.pullAll({
+    silent: false,
+    skipSessions,
+    workspaceTargetOverrides: Object.keys(targetOverrides).length > 0 ? targetOverrides : null,
+  });
+  if (!pullRes.ok) {
+    io.err(`拉取失败：${pullRes.reason || '未知错误'}`);
+    await controller.dispose();
+    return 1;
   }
 
-  // Determine which workspaces have commits in the vault so disaster recovery on a fresh machine can auto-create localRoot
-  const { commits: allWsCommits } = await controller.vault.listCommits('workspace', { includeSelf: false });
-  const remoteWsIds = new Set(allWsCommits.map((c) => c.targetId));
-
-  const wsResults = [];
-  for (const mapping of controller.config.workspaceMappings ?? []) {
-    const localRoot = mapping[io.platform];
-    if (!localRoot) continue;
-    const exists = await pathExists(localRoot);
-    if (!exists && !remoteWsIds.has(mapping.id)) continue;
-    if (!exists) {
-      await fs.mkdir(localRoot, { recursive: true });
-    }
-    const wsRes = await pullWorkspaceDeliverables({
-      dshHome,
-      vault: controller.vault,
-      workspaceId: mapping.id,
-      workspaceRoot: localRoot,
-      trashRetentionDays: controller.config.quotas?.trashRetentionDays,
-    });
-    wsResults.push({ id: mapping.id, title: mapping.title, ...wsRes });
-  }
+  const globalRes = pullRes.global ?? { pulled: false };
+  const sessionSummary = pullRes.sessions?.summary ?? { imported: 0, fastForwarded: 0, forkedBranches: 0, upToDate: 0 };
+  const wsResults = pullRes.workspaces ?? [];
 
   const totalApplied = wsResults.reduce((s, w) => s + w.applied.length, 0);
   const totalDrained = wsResults.reduce((s, w) => s + w.drainedIncoming.length, 0);
@@ -807,6 +776,7 @@ async function runPull(flags, dshHome, io) {
   if (totalStaged > 0) {
     io.out(`⚠️ 有 ${totalStaged} 个文件因本地 Excel/Office 占锁已暂存于 .dsh-incoming/，关闭软件后再次运行 dsh-soul pull 即可自动落位。`);
   }
+  await controller.dispose();
   return 0;
 }
 
@@ -1002,12 +972,14 @@ async function runDoctor(dshHome, io) {
     }
   }
 
-  // 3. Encryption key completeness
+  // 3. Encryption key completeness & C3b vault decryption verification
+  let loadedSecretKey = null;
   if (config) {
     if (config.encryptionEnabled) {
       try {
         const key = await loadPassphraseKey(dshHome);
         if (key && key.encKey.length === 32 && key.hmacKey.length === 32) {
+          loadedSecretKey = key;
           pass('encryption', '已开启 AES-256-GCM 且本机 secret.key 完整');
         } else {
           fail('encryption', '已开启加密但缺少本机 secret.key，请重新运行 dsh-soul init --passphrase');
@@ -1017,6 +989,35 @@ async function runDoctor(dshHome, io) {
       }
     } else {
       pass('encryption', '明文模式（未开启加密）');
+    }
+
+    // C3b: Test-decrypt existing vault commits so a mistyped passphrase on a 2nd machine fails doctor immediately!
+    if (config.vaultDir && (await pathExists(config.vaultDir)) && (!config.encryptionEnabled || loadedSecretKey)) {
+      try {
+        const probeVault = new VaultStore({
+          vaultDir: config.vaultDir,
+          deviceId: config.deviceId,
+          platform: io.platform,
+          secretKeys: config.encryptionEnabled ? loadedSecretKey : null,
+          quotas: config.quotas,
+        });
+        const stats = await probeVault.countReadableDeviceStats();
+        if (stats.totalFailedCount > 0 && stats.totalDecryptedCount === 0) {
+          fail(
+            'vault-decrypt',
+            `金库中有 ${stats.totalFailedCount} 条现有提交全部解密失败（0 条可读）——本机口令与金库已有设备不一致，请核对口令后重新配置`,
+          );
+        } else if (stats.totalFailedCount > 0) {
+          warn(
+            'vault-decrypt',
+            `当前口令可读 ${stats.totalDecryptedCount} 条提交，但金库中仍有 ${stats.totalFailedCount} 条旧/错口令提交无法解密`,
+          );
+        } else if (stats.totalDecryptedCount > 0) {
+          pass('vault-decrypt', `成功解密验证金库现有 ${stats.totalDecryptedCount} 条提交`);
+        }
+      } catch (err) {
+        warn('vault-decrypt', `金库解密校验出错: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 

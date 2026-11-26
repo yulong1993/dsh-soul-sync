@@ -132,9 +132,9 @@ test('hygiene: .gitattributes, LF-only mac/bin scripts, and pure-ASCII PS 5.1 ze
 });
 
 test('bin/dsh-soul.js full CLI roundtrip: Win init+keep+push -> Encrypted Vault -> Mac init+pull+config+status+doctor+watch', async () => {
-  // Sanity-check mapping parser for both id=win::mac and auto-id win::mac
+  // Sanity-check mapping parser for both id=win::mac and auto-id win::mac (C6/C9: deterministic <base>-<hash4>)
   const parsedAuto = parseWorkspaceMappingSpec('D:\\美股分析::/Users/me/美股分析');
-  assert.equal(parsedAuto.id, '美股分析');
+  assert.match(parsedAuto.id, /^美股分析-[0-9a-f]{4}$/);
   assert.equal(parsedAuto.win32, 'D:\\美股分析');
   assert.equal(parsedAuto.darwin, '/Users/me/美股分析');
 
@@ -626,22 +626,34 @@ test(
                 clientBundleText = await bundleResp.text();
               }
 
-              // B. Verify CSRF protection: missing custom header -> 403; evil Origin -> 403
-              const noHeaderResp = await fetch(`${baseUrl}/__soul-sync/api/state`);
+              // B. Verify C1 cookie auth + CSRF protection:
+              //    - Unauthenticated (no cookie) -> 401
+              //    - Cross-port localhost Origin -> 403
+              //    - Authenticated without x-dsh-soul-sync header -> 403
+              //    - Evil external Origin -> 403
+              const unauthResp = await fetch(`${baseUrl}/__soul-sync/api/state`, {
+                headers: { 'x-dsh-soul-sync': '1' },
+              });
+              const crossPortResp = await fetch(`${baseUrl}/__soul-sync/api/state`, {
+                headers: { ...authHeaders, 'x-dsh-soul-sync': '1', origin: 'http://localhost:5173' },
+              });
+              const noHeaderResp = await fetch(`${baseUrl}/__soul-sync/api/state`, {
+                headers: authHeaders,
+              });
               const evilOriginResp = await fetch(`${baseUrl}/__soul-sync/api/state`, {
-                headers: { 'x-dsh-soul-sync': '1', origin: 'https://evil.example.com' },
+                headers: { ...authHeaders, 'x-dsh-soul-sync': '1', origin: 'https://evil.example.com' },
               });
 
               // C. Verify authenticated loopback GET /__soul-sync/api/state
               const stateResp = await fetch(`${baseUrl}/__soul-sync/api/state`, {
-                headers: { 'x-dsh-soul-sync': '1' },
+                headers: { ...authHeaders, 'x-dsh-soul-sync': '1' },
               });
               const stateJson = await stateResp.json();
 
               // D. Verify POST /__soul-sync/api/settings toggles folderMatchMode & syncScope live
               const settingsResp = await fetch(`${baseUrl}/__soul-sync/api/settings`, {
                 method: 'POST',
-                headers: { 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
+                headers: { ...authHeaders, 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
                 body: JSON.stringify({ folderMatchMode: 'mapped-only', syncScope: 'selected' }),
               });
               const settingsJson = await settingsResp.json();
@@ -649,14 +661,14 @@ test(
               // Reset back to auto-mirror / active so subsequent checks see clean defaults
               await fetch(`${baseUrl}/__soul-sync/api/settings`, {
                 method: 'POST',
-                headers: { 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
+                headers: { ...authHeaders, 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
                 body: JSON.stringify({ folderMatchMode: 'auto-mirror', syncScope: 'active' }),
               });
 
               // E. Verify POST /__soul-sync/api/pull-selected works end-to-end against live host
               const pullSelResp = await fetch(`${baseUrl}/__soul-sync/api/pull-selected`, {
                 method: 'POST',
-                headers: { 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
+                headers: { ...authHeaders, 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
                 body: JSON.stringify({ sessionIds: [liveSessId] }),
               });
               const pullSelJson = await pullSelResp.json();
@@ -666,6 +678,8 @@ test(
                 bootIncludesPlugin,
                 clientBundleStatus,
                 clientBundleText,
+                unauthStatus: unauthResp.status,
+                crossPortStatus: crossPortResp.status,
                 noHeaderStatus: noHeaderResp.status,
                 evilOriginStatus: evilOriginResp.status,
                 stateStatus: stateResp.status,
@@ -708,7 +722,9 @@ test(
       assert.equal(bootResult.httpReport.clientBundleStatus, 200, 'DSH /plugins/ bundle for dsh-soul-sync/client must return 200');
       assert.match(bootResult.httpReport.clientBundleText, /window\.__ModuleLoader__\.load/);
       assert.match(bootResult.httpReport.clientBundleText, /Soul Sync 跨机迁移/);
-      assert.equal(bootResult.httpReport.noHeaderStatus, 403, 'CSRF guard must reject requests without x-dsh-soul-sync header');
+      assert.equal(bootResult.httpReport.unauthStatus, 401, 'C1: cookie-less request must be rejected with 401 by host connection auth');
+      assert.equal(bootResult.httpReport.crossPortStatus, 403, 'C1: cross-port localhost Origin must be rejected with 403');
+      assert.equal(bootResult.httpReport.noHeaderStatus, 403, 'CSRF guard must reject authenticated requests without x-dsh-soul-sync header');
       assert.equal(bootResult.httpReport.evilOriginStatus, 403, 'CSRF guard must reject non-loopback Origin');
       assert.equal(bootResult.httpReport.stateStatus, 200);
       assert.equal(bootResult.httpReport.stateJson.ok, true);

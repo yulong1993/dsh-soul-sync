@@ -92,7 +92,7 @@ return await agent({
 
 用户在日常对话或通过 `/soul <大白话>` 提出同步管理诉求（例如“把刚才那个估值表也同步上”、“帮我对比一下冲突副本和现在的表差在哪并合并”、“看看今天新建的脚本哪些还没进同步账本”、“排查为什么有文件被拦截”）时，系统会自动把 `[Soul Sync 自然语言协同请求]` 连同实时体检卡与 `bin/dsh-soul.js` 精确路径交给你：
 
-1. **查看同步状态与账本**：运行 `node "<repoRoot>/bin/dsh-soul.js" --dsh-home "<dshHome>" status` 或 `doctor` 检查金库、加密、双端心跳、步级快照开关与占锁状态；需要查看某工作区受管文件列表时，读取 `<dshHome>/soul-sync/state/workspace-<id>.json`。
+1. **查看同步状态与账本**：运行 `node "<repoRoot>/bin/dsh-soul.js" --dsh-home "<dshHome>" status` 或 `doctor` 检查金库、加密、双端心跳、步级快照开关与占锁状态；需要查看某工作区受管文件列表时，读取 `<dshHome>/soul-sync/workspaces/<encodedId>.json`。
 2. **帮用户把指定文件纳管并推送**：定位用户口头提到的文件（如刚修改的估值表、脚本或笔记），执行 `node "<repoRoot>/bin/dsh-soul.js" --dsh-home "<dshHome>" keep "<文件路径>"`。
 3. **调整配额或开关 30 秒防断电快照**：执行 `node "<repoRoot>/bin/dsh-soul.js" --dsh-home "<dshHome>" config stepSync=off`（或 `stepSync=on`、`maxFileMB=100`、`maxWorkspaceMB=1024`、`retainSnapshots=20`）。
 4. **对比并合并双边冲突副本**：定位工作区中带 ` (来自...)` 后缀的冲突副本与本地原文件，逐项对比差异（文本/Markdown/Python 直接 diff，Excel 用 Python `openpyxl` 读取核对单元格差异），严禁擅自覆盖人工排版模板；向用户简明汇报差异并完成安全合并后，执行 `push` 将最新结果同步到金库。

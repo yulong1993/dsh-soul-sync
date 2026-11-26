@@ -8,6 +8,7 @@ import {
   SOUL_COMPACTION_SECTIONS,
   SOUL_COMPACTION_INSTRUCTION,
   SOUL_RECALL_HINT_LINE,
+  BUDGET_TRIM_NOTICE,
   SUMMARY_OPEN_TAG,
   SUMMARY_CLOSE_TAG,
   CHECKPOINT_PREAMBLE,
@@ -16,10 +17,14 @@ import {
   rewriteCompactionStreamOptions,
   estimateFramedSummaryTokens,
   estimateShadowedBudgetTokens,
+  computeSummaryBudget,
+  compressSummaryToBudget,
   wrapCompactionStreamWithBudgetGuard,
   interceptCompactionStream,
 } from '../lib/compaction-soul.js';
 import {
+  STALE_COMPACTION_TIMEOUT_MS,
+  DEFAULT_COMPACTION_MAX_TOKENS,
   compactSessionPreservingTail,
   selectTailPreservingSpan,
 } from '../lib/tail-compactor.js';
@@ -791,4 +796,256 @@ test('Host plugin registers soul_recall_history via ctx.inject([tools]) and exec
   assert.equal(commits.commits.length, 1);
 
   await controller.dispose();
+});
+
+test('Opus C14: /soul compact K with K >= totalHumanTurns returns noop without silently lowering keepTurns', async () => {
+  const session = createMockSession({ id: 'sess-c14-noop' });
+  session.append('system/message', {
+    message: { id: 'sys-c14', role: 'system', content: [{ type: 'text', text: 'System instructions' }] },
+  }, { surfaceOp: 'append' });
+
+  // 2 rich turns that would previously have silently downgraded keepTurns=50 -> 1 and shadowed turn 1!
+  for (let t = 1; t <= 2; t += 1) {
+    session.append('turn/start', { turn: t });
+    session.append('user/message', makeUserMsg(`第${t}轮超长分析请求：请拆解英伟达毛利率与估值区间。`.repeat(12)), { surfaceOp: 'append' });
+    session.append('assistant/message', makeAssistantMsg([
+      { type: 'text', text: `第${t}轮详尽分析结果：毛利率73.5%，营收增速+78%。`.repeat(12) },
+    ]), { surfaceOp: 'append' });
+    session.append('turn/end', { turn: t });
+  }
+
+  assert.equal(selectTailPreservingSpan(session, { keepTurns: 50 }), null);
+  assert.equal(selectTailPreservingSpan(session, { keepTurns: 2 }), null);
+
+  let streamCalled = false;
+  const mockCtx = {
+    llm: {
+      stream() {
+        streamCalled = true;
+        return chunksFromArray([]);
+      },
+    },
+  };
+
+  const beforeLen = session.snapshotEvents().length;
+  const res = await compactSessionPreservingTail({ ctx: mockCtx, session, keepTurns: 50 });
+  assert.equal(res.status, 'noop');
+  assert.equal(res.ok, true);
+  assert.equal(res.keptTurns, 2);
+  assert.match(res.message, /2/);
+  assert.match(res.message, /50/);
+  assert.equal(streamCalled, false, 'LLM stream must not be invoked on noop');
+  assert.equal(session.snapshotEvents().length, beforeLen, 'No compaction events should be appended on noop');
+});
+
+test('Opus R6 + Neon Risk 2: records startedAt, auto-closes stale (>10m) unclosed compaction, keeps fresh active compaction busy, and passes maxTokens to llm.stream', async () => {
+  const makeMultiTurnSession = (id) => {
+    const sess = createMockSession({ id });
+    for (let t = 1; t <= 4; t += 1) {
+      sess.append('user/message', makeUserMsg(`第${t}轮问题：详细核对现金流与折现率假设。`.repeat(8)), { surfaceOp: 'append' });
+      sess.append('assistant/message', makeAssistantMsg([
+        { type: 'text', text: `第${t}轮结论：已完成现金流折现模型校验。`.repeat(8) },
+      ]), { surfaceOp: 'append' });
+    }
+    return sess;
+  };
+
+  const observedStreamOpts = [];
+  const makeCtx = () => ({
+    llm: {
+      stream(opts) {
+        observedStreamOpts.push(opts);
+        const text = [
+          SOUL_COMPACTION_SECTIONS[0],
+          '- 现金流折现率校验锁定',
+          '',
+          SOUL_COMPACTION_SECTIONS[5],
+          `- ${SOUL_RECALL_HINT_LINE}`,
+        ].join('\n');
+        return chunksFromArray([
+          { type: 'text-delta', index: 0, text },
+          { type: 'block-end', index: 0, block: { type: 'text', text } },
+          { type: 'finish', reason: { kind: 'stop' } },
+        ]);
+      },
+    },
+    sessions: { async flush() {} },
+  });
+
+  // 1) Recent active compaction (1 minute old) -> MUST remain busy (not prematurely killed)
+  const freshSess = makeMultiTurnSession('sess-r6-fresh');
+  const now = Date.now();
+  freshSess.append('compaction/start', {
+    compactionId: 'cmp-fresh',
+    turn: null,
+    startedAt: now - 60_000,
+  });
+  const freshRes = await compactSessionPreservingTail({
+    ctx: makeCtx(),
+    session: freshSess,
+    keepTurns: 2,
+    nowMs: now,
+  });
+  assert.equal(freshRes.status, 'busy');
+  assert.equal(freshRes.ok, false);
+  assert.equal(hasUnclosedCompaction(freshSess.snapshotEvents()), true);
+
+  // 2) Stale unclosed compaction (11 minutes old) -> MUST append recovery compaction/end and proceed cleanly!
+  const staleSess = makeMultiTurnSession('sess-r6-stale');
+  staleSess.append('compaction/start', {
+    compactionId: 'cmp-stale-crashed',
+    turn: null,
+    startedAt: now - (STALE_COMPACTION_TIMEOUT_MS + 60_000),
+  });
+  assert.equal(hasUnclosedCompaction(staleSess.snapshotEvents()), true);
+
+  const staleRes = await compactSessionPreservingTail({
+    ctx: makeCtx(),
+    session: staleSess,
+    keepTurns: 2,
+    nowMs: now,
+  });
+  assert.equal(staleRes.status, 'compacted', staleRes.message);
+  assert.equal(staleRes.ok, true);
+
+  const events = staleSess.snapshotEvents();
+  assert.equal(hasUnclosedCompaction(events), false, 'Session must have no unclosed compaction after recovery');
+  const recoveryEnd = events.find((e) => e.type === 'compaction/end' && e.data?.compactionId === 'cmp-stale-crashed');
+  assert.ok(recoveryEnd, 'Must append recovery compaction/end for stale compactionId');
+  assert.ok(
+    JSON.stringify(recoveryEnd.data.error).includes('stale compaction auto-closed'),
+    `Expected stale recovery error, got: ${JSON.stringify(recoveryEnd.data.error)}`,
+  );
+
+  // Verify new compaction/start carries startedAt and stream received default maxTokens
+  const newStart = events.find((e) => e.type === 'compaction/start' && e.data?.compactionId === staleRes.compactionId);
+  assert.ok(Number.isFinite(newStart?.data?.startedAt), 'compaction/start must include numeric startedAt');
+  assert.equal(observedStreamOpts.length, 1);
+  assert.equal(observedStreamOpts[0].maxTokens, DEFAULT_COMPACTION_MAX_TOKENS);
+
+  // Verify explicit maxTokens option is forwarded to ctx.llm.stream
+  const customSess = makeMultiTurnSession('sess-max-tokens');
+  const customRes = await compactSessionPreservingTail({
+    ctx: makeCtx(),
+    session: customSess,
+    keepTurns: 2,
+    maxTokens: 2048,
+  });
+  assert.equal(customRes.status, 'compacted');
+  assert.equal(observedStreamOpts[1].maxTokens, 2048);
+
+  // Also verify R9 in tail-compactor: model omitted [压缩代次: G1], checkpoint still has it!
+  const checkpointEv = customSess.eventAt(customRes.checkpointSeq);
+  const checkpointText = checkpointEv.data.content.map((b) => b.text).join('\n');
+  assert.ok(checkpointText.includes('[压缩代次: G1]'), 'tail-compactor must ensure [压缩代次: G1] when model omits it');
+});
+
+test('Opus R5 + R9: budget floor stops multi-gen ratchet erosion, protects 10 axioms + SOUL_RECALL_HINT_LINE + adds trim notice, and deterministically tracks generation tags', async () => {
+  // 1) R5a: Ledger floor prevents ratchet-shrinking an already compact prior ledger across 5 short-span compactions
+  const sysMsg = { role: 'system', content: [{ type: 'text', text: 'System prompt' }] };
+  const initialLedger = [
+    '[压缩代次: G1]',
+    SOUL_COMPACTION_SECTIONS[0],
+    ...Array.from({ length: 8 }, (_, i) => `- 公理${i + 1}：核心指标 #${i + 1} 锁定为 ${(20 + i * 1.1).toFixed(1)}%，禁止擅自更改。`),
+    '',
+    SOUL_COMPACTION_SECTIONS[1],
+    '- 已完成阶段一与阶段二关键推演收敛。',
+    '',
+    SOUL_COMPACTION_SECTIONS[2],
+    '- 伤疤1：否决单阶段 DCF；伤疤2：否决未剔除非经常项口径。',
+    '',
+    SOUL_COMPACTION_SECTIONS[3],
+    '- 待补齐海外产能爬坡节奏。',
+    '',
+    SOUL_COMPACTION_SECTIONS[4],
+    '- outputs/model_v1.xlsx, scripts/valuation.py',
+    '',
+    SOUL_COMPACTION_SECTIONS[5],
+    `- 直给核心矛盾。${SOUL_RECALL_HINT_LINE}`,
+  ].join('\n');
+
+  let ledger = initialLedger;
+  const lengths = [ledger.length];
+  for (let gen = 2; gen <= 6; gen += 1) {
+    const priorCheckpointMsg = makeUserMsg(
+      `${CHECKPOINT_PREAMBLE}\n\n${SUMMARY_OPEN_TAG}\n${ledger}\n${SUMMARY_CLOSE_TAG}`,
+      { kind: 'compact-checkpoint', compactionId: `cmp-${gen - 1}` },
+    );
+    const shortTurnUser = makeUserMsg(`第${gen}轮简短补充：请核对一下海外储能毛利率和下季指引口径。`.repeat(4));
+    const shortTurnAsst = makeAssistantMsg([
+      { type: 'text', text: `第${gen}轮简短回复：已核对下季指引口径并记录，未推翻前期任何核心公理。`.repeat(4) },
+    ]).message;
+    const opts = {
+      purpose: 'compaction',
+      messages: [sysMsg, priorCheckpointMsg, shortTurnUser, shortTurnAsst, makeUserMsg('Summarize')],
+    };
+
+    const shadowed = estimateShadowedBudgetTokens(opts.messages);
+    const budget = computeSummaryBudget(shadowed, { messages: opts.messages });
+    assert.ok(budget.priorLedgerTokens > 100, 'Must detect priorLedgerTokens from messages');
+    assert.ok(
+      budget.targetFramedTokens >= Math.min(shadowed - 1, budget.priorLedgerTokens),
+      `Budget target (${budget.targetFramedTokens}) must not undercut priorLedgerTokens (${budget.priorLedgerTokens})`,
+    );
+
+    // Model outputs same compact ledger WITHOUT generation tag (also testing R9 deterministic injection!)
+    const modelOutputWithoutTag = ledger.replace(/^\[压缩代次: G\d+\]\n?/, '');
+    const rawChunks = [
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: modelOutputWithoutTag },
+      { type: 'block-end', index: 0, block: { type: 'text', text: modelOutputWithoutTag } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ];
+    const stream = interceptCompactionStream(opts, () => chunksFromArray(rawChunks));
+    const chunks = [];
+    for await (const c of stream) chunks.push(c);
+    const outText = chunks.find((c) => c.type === 'block-end').block.text;
+
+    assert.ok(outText.includes(`[压缩代次: G${gen}]`), `R9: must deterministically inject [压缩代次: G${gen}]`);
+    assert.ok(outText.includes(SOUL_RECALL_HINT_LINE), `Gen ${gen} must retain SOUL_RECALL_HINT_LINE`);
+    assert.ok(outText.includes('公理8：'), `Gen ${gen} must retain all 8 axioms without ratchet loss`);
+    assert.ok(estimateFramedSummaryTokens(outText) < shadowed, `Gen ${gen} must strictly stay < shadowedBudgetTokens`);
+    ledger = outText;
+    lengths.push(ledger.length);
+  }
+  assert.ok(
+    lengths[lengths.length - 1] >= lengths[0] - 20,
+    `Ledger must NOT ratchet-erode across 5 short-span compactions: ${JSON.stringify(lengths)}`,
+  );
+
+  // 2) R5b: compressSummaryToBudget protects ALL 10 Pinned Axioms & SOUL_RECALL_HINT_LINE, adds BUDGET_TRIM_NOTICE, ensures [压缩代次: G4]
+  const tenAxioms = Array.from({ length: 10 }, (_, i) => `- 钢印公理#${i + 1}：参数=${100 + i}%`);
+  const oversized = [
+    SOUL_COMPACTION_SECTIONS[0],
+    ...tenAxioms,
+    '',
+    SOUL_COMPACTION_SECTIONS[1],
+    '- ' + '冗长历史里程碑流水账细节'.repeat(20),
+    '- 次要推演细节行2',
+    '- 次要推演细节行3',
+    '',
+    SOUL_COMPACTION_SECTIONS[2],
+    '- 伤疤A：否决旧方案A',
+    '- 伤疤B：否决旧方案B',
+    '',
+    SOUL_COMPACTION_SECTIONS[3],
+    '- 缺口A：待核实数据A',
+    '',
+    SOUL_COMPACTION_SECTIONS[4],
+    '- outputs/table.xlsx',
+    '',
+    SOUL_COMPACTION_SECTIONS[5],
+    '- ' + '冗长沟通偏好与环境流水账描述'.repeat(20),
+    `- ${SOUL_RECALL_HINT_LINE}`,
+  ].join('\n');
+
+  const maxChars = 760;
+  const compressed = compressSummaryToBudget(oversized, maxChars, { generation: 4 });
+  assert.ok(compressed.length <= maxChars, `compressed length (${compressed.length}) must be <= ${maxChars}`);
+  assert.ok(compressed.includes('[压缩代次: G4]'), 'Must deterministically inject [压缩代次: G4]');
+  assert.ok(compressed.includes(SOUL_RECALL_HINT_LINE), 'Must NEVER drop SOUL_RECALL_HINT_LINE');
+  assert.ok(compressed.includes(BUDGET_TRIM_NOTICE), 'Must append explicit BUDGET_TRIM_NOTICE whenever lines are trimmed');
+  for (let i = 1; i <= 10; i += 1) {
+    assert.ok(compressed.includes(`钢印公理#${i}：参数=${99 + i}%`), `Must protect Pinned Axiom #${i} before touching priority 0`);
+  }
 });
