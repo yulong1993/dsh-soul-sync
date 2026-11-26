@@ -20,6 +20,7 @@ import {
   exportSessionClosure,
   exportAllLocalSessions,
   pullSessionsFromVault,
+  scanLocalSessions,
   listLocalCatalog,
   listVaultCatalog,
   shouldAutoSyncSession,
@@ -511,9 +512,16 @@ test('P1-4 / F10 + P1-5 / F4 + F5 + F12: blank-page /soul status non-sync, colla
   const blankAgent = { session: blankSession, phase: { kind: 'idle', lastTurn: 0 } };
   const cmdRes = await ctrl.handleSlashCommand({ agent: blankAgent, rawInput: 'status' });
   assert.equal(cmdRes.kind, 'success');
-  assert.ok(blankEvents.length === 6, 'Blank session should receive synthetic card turn');
-  assert.equal(blankEvents[1].data.source.kind, 'dsh-soul-sync-card');
-  assert.equal(blankEvents[1].data.source.form, 'notice');
+  assert.equal(blankEvents.length, 6, 'Blank session should receive synthetic card turn');
+  assert.equal(blankEvents[0].type, 'turn/start');
+  assert.equal(blankEvents[1].type, 'step/start', 'step/start must precede user/message');
+  assert.equal(blankEvents[2].type, 'user/message');
+  assert.equal(blankEvents[2].data.source.kind, 'dsh-soul-sync-card');
+  assert.equal(blankEvents[2].data.source.form, 'notice');
+  assert.equal(blankEvents[3].type, 'assistant/message');
+  assert.equal(blankEvents[4].type, 'step/end');
+  assert.equal(blankEvents[5].type, 'turn/end');
+  assert.equal(blankEvents[5].data.reason?.kind, 'completed', 'turn/end MUST include reason.kind=completed so dsh-client-ui-chat never crashes');
   assert.equal(countUserTurns(blankEvents), 0);
   assert.equal(isSubstantiveSession(blankEvents, blankSession.header), false);
 
@@ -549,15 +557,16 @@ test('P1-4 / F10 + P1-5 / F4 + F5 + F12: blank-page /soul status non-sync, colla
   assert.equal(decA.messages.length, 1, 'Workspace B alert must NEVER leak into Session A');
   assert.equal(ctrl._pendingAlerts.length, 1, 'Unrelated alert must remain unread');
 
-  // Session B receives Workspace B's alert prepended as a collapsed dsh-soul-sync notice
+  // Session B receives Workspace B's alert appended AFTER the user message as a collapsed dsh-soul-sync notice
   const decB = await ctrl.handleAgentPreStep(
     { agent: { session: { id: 'sess-in-b', cwd: wsB } } },
     () => ({ kind: 'continue', messages: [{ id: 'u-b', role: 'user', content: [{ type: 'text', text: 'B的问题' }] }] }),
   );
   assert.equal(decB.messages.length, 2);
-  assert.equal(decB.messages[0].source.kind, 'dsh-soul-sync');
-  assert.equal(decB.messages[0].source.form, 'notice');
-  assert.match(decB.messages[0].content[0].text, /项目B/);
+  assert.equal(decB.messages[0].id, 'u-b');
+  assert.equal(decB.messages[1].source.kind, 'dsh-soul-sync');
+  assert.equal(decB.messages[1].source.form, 'notice');
+  assert.match(decB.messages[1].content[0].text, /项目B/);
   assert.equal(ctrl._pendingAlerts.length, 0);
 
   // Alerts can also be dismissed via HTTP API
@@ -766,4 +775,253 @@ test('P2-3 / F13: 200-session GET /__soul-sync/api/state benchmark < 1000ms & ca
   assert.ok(elapsedMs < 1000, `Expected 200-session GET /state < 1000ms, got ${elapsedMs.toFixed(1)}ms`);
 
   await ctrl.dispose();
+});
+
+test('Re-audit regressions: dual-selected pullAll reply roundtrip, unpublish LWW restore (no zombie tombstone), wrong-passphrase own-commit purge & poller recovery', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'reaudit-regressions');
+
+  // --- Regression A (P1-1 / P1-A): Both machines in syncScope='selected' ---
+  // Win pushAll -> Mac pullAll -> Mac replies (turn/end + pushAll) -> Win pullAll (fastForwarded===1) -> Win replies -> Mac pullAll (fastForwarded===1, zero fork!)
+  {
+    const subDir = path.join(caseDir, 'dual-selected-roundtrip');
+    const winHome = path.join(subDir, 'win-home');
+    const macHome = path.join(subDir, 'mac-home');
+    const vaultDir = path.join(subDir, 'vault');
+    const winWs = path.join(subDir, 'win-ws');
+    const macWs = path.join(subDir, 'mac-ws');
+    await fs.mkdir(path.join(winWs, 'outputs'), { recursive: true });
+    await fs.mkdir(macWs, { recursive: true });
+    await fs.mkdir(vaultDir, { recursive: true });
+
+    const mappings = [{ id: 'dual-proj', title: 'DualProj', win32: winWs, darwin: macWs, linux: macWs }];
+    await savePassphraseKey(winHome, 'dual-secret');
+    await savePassphraseKey(macHome, 'dual-secret');
+    await saveConfig(winHome, {
+      deviceId: 'win-dual',
+      deviceLabel: 'WinDual',
+      platform: 'win32',
+      vaultDir,
+      encryptionEnabled: true,
+      syncScope: 'selected',
+      selectedSessionIds: ['sess-dual-1'],
+      workspaceMappings: mappings,
+    });
+    await saveConfig(macHome, {
+      deviceId: 'mac-dual',
+      deviceLabel: 'MacDual',
+      platform: 'darwin',
+      vaultDir,
+      encryptionEnabled: true,
+      syncScope: 'selected',
+      selectedWorkspaces: [],
+      selectedSessionIds: [],
+      workspaceMappings: mappings,
+    });
+
+    const header = { type: 'session', version: 4, id: 'sess-dual-1', createdAt: 1000, cwd: winWs, isSeeded: false, delegationDepth: 0 };
+    const turn1 = [
+      { seq: 0, time: 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Win第一轮提问' }] } },
+      { seq: 1, time: 1150, type: 'assistant/message', data: { content: [{ type: 'text', text: 'Win第一轮回答' }] } },
+    ];
+    await writeLocalSession(winHome, header, turn1);
+    await fs.writeFile(path.join(winWs, 'outputs', 'dual-note.md'), '# Dual Selected Deliverable\n', 'utf8');
+
+    const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
+    const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', minQuietMs: 0, pollIntervalMs: 0 });
+    try {
+      await winCtrl.reloadConfig();
+      await macCtrl.reloadConfig();
+
+      // 1. Win pushAll pushes sess-dual-1 AND its mapped workspace deliverable even though selectedWorkspaces is empty!
+      const winPush1 = await winCtrl.pushAll();
+      assert.equal(winPush1.ok, true);
+      assert.equal(winPush1.sessionPushedCount, 1);
+      assert.equal(winPush1.workspaces.length, 1);
+      assert.ok(winPush1.workspaces[0].uploaded.includes('outputs/dual-note.md'));
+
+      // 2. Mac pullAll (selected mode, empty whitelist) imports sess-dual-1 AND persists it into selectedSessionIds!
+      const macPull1 = await macCtrl.pullAll();
+      assert.equal(macPull1.sessions.summary.imported, 1);
+      const macCfg1 = await loadConfig(macHome);
+      assert.ok(macCfg1.selectedSessionIds.includes('sess-dual-1'), 'pullAll must auto-track imported session in selectedSessionIds');
+
+      // 3. Mac replies -> write turn 2 locally on Mac -> Mac turn/end export + pushAll -> Win pullAll MUST fast-forward!
+      const macScanned = await scanLocalSessions(macHome);
+      const macRec = macScanned.get('sess-dual-1');
+      assert.ok(macRec);
+      const macTurn2 = [
+        ...macRec.events,
+        { seq: 2, time: 2000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Mac第二轮续聊' }] } },
+        { seq: 3, time: 2050, type: 'assistant/message', data: { content: [{ type: 'text', text: 'Mac第二轮回答' }] } },
+      ];
+      await writeLocalSession(macHome, macRec.header, macTurn2);
+
+      const macPush = await macCtrl.pushAll();
+      assert.equal(macPush.sessionPushedCount, 1, 'Mac reply on auto-pulled session must push back under syncScope=selected');
+
+      const winPull = await winCtrl.pullAll();
+      assert.equal(winPull.sessions.summary.fastForwarded, 1, 'Win must fast-forward Mac reply');
+      assert.equal(winPull.sessions.summary.forkedBranches, 0);
+
+      // 4. Win replies turn 3 -> Mac pulls -> MUST fast-forward with ZERO forked-branch!
+      const winScanned = await scanLocalSessions(winHome);
+      const winRec = winScanned.get('sess-dual-1');
+      const winTurn3 = [
+        ...winRec.events,
+        { seq: 4, time: 3000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Win第三轮续聊' }] } },
+        { seq: 5, time: 3050, type: 'assistant/message', data: { content: [{ type: 'text', text: 'Win第三轮回答' }] } },
+      ];
+      await writeLocalSession(winHome, winRec.header, winTurn3);
+      await winCtrl.pushAll();
+      const macPull2 = await macCtrl.pullAll();
+      assert.equal(macPull2.sessions.summary.fastForwarded, 1);
+      assert.equal(macPull2.sessions.summary.forkedBranches, 0, 'No split-brain fork when roundtripping in dual-selected mode');
+    } finally {
+      await winCtrl.dispose();
+      await macCtrl.dispose();
+    }
+  }
+
+  // --- Regression B (P1-2): unpublish -> Mac pullAll -> Win pushSelected (NO new turn) -> Mac pullAll imports cleanly (no zombie tombstone) ---
+  {
+    const subDir = path.join(caseDir, 'unpublish-lww-restore');
+    const winHome = path.join(subDir, 'win-home');
+    const macHome = path.join(subDir, 'mac-home');
+    const vaultDir = path.join(subDir, 'vault');
+    const winWs = path.join(subDir, 'win-ws');
+    await fs.mkdir(winWs, { recursive: true });
+    await fs.mkdir(vaultDir, { recursive: true });
+
+    await savePassphraseKey(winHome, 'lww-secret');
+    await savePassphraseKey(macHome, 'lww-secret');
+    await saveConfig(winHome, { deviceId: 'win-lww', deviceLabel: 'WinLWW', platform: 'win32', vaultDir, encryptionEnabled: true });
+    await saveConfig(macHome, {
+      deviceId: 'mac-lww',
+      deviceLabel: 'MacLWW',
+      platform: 'darwin',
+      vaultDir,
+      encryptionEnabled: true,
+      autoMirrorRoot: path.join(subDir, 'mac-mirrors'),
+    });
+
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: 'sess-zombie-1', createdAt: 1000, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '将被撤回再恢复的老对话' }] } }],
+    );
+
+    const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
+    const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', minQuietMs: 0, pollIntervalMs: 0 });
+    try {
+      await winCtrl.reloadConfig();
+      await macCtrl.reloadConfig();
+
+      await winCtrl.pushAll();
+      await winCtrl.unpublishSessionFromVault({ sessionIds: ['sess-zombie-1'] });
+
+      // Mac pulls and re-publishes global metadata containing the withdrawn tombstone
+      const macPullBefore = await macCtrl.pullAll();
+      assert.equal(macPullBefore.sessions.summary.imported, 0);
+      assert.ok((await loadConfig(macHome)).withdrawnSessions['sess-zombie-1'] > 0);
+
+      // Win explicitly re-pushes sess-zombie-1 with NO new turn -> LWW restoredSessions must override Mac's old tombstone!
+      const repush = await winCtrl.pushSelected({ sessionIds: ['sess-zombie-1'] });
+      assert.equal(repush.ok, true);
+      assert.equal(repush.sessionPushedCount, 1);
+
+      const winCfgAfter = await loadConfig(winHome);
+      assert.equal(winCfgAfter.withdrawnSessions['sess-zombie-1'], undefined, 'Zombie tombstone must NOT resurrect on Win');
+      assert.ok(winCfgAfter.restoredSessions['sess-zombie-1'] > 0, 'LWW restoredSessions timestamp must be recorded');
+
+      // Mac pullAll receives the restored session cleanly!
+      const macPullAfter = await macCtrl.pullAll();
+      assert.equal(macPullAfter.sessions.summary.imported, 1, 'Mac must import explicitly restored session without new turn');
+      const macCfgAfter = await loadConfig(macHome);
+      assert.equal(macCfgAfter.withdrawnSessions['sess-zombie-1'], undefined, 'Tombstone must be cleared on Mac too');
+    } finally {
+      await winCtrl.dispose();
+      await macCtrl.dispose();
+    }
+  }
+
+  // --- Regression C (P1-3 + Opus P1-B): Wrong passphrase on Mac + sync -> fix passphrase via updateSettings ->
+  // Win sees decryptionFailedCount===0, pruneHistory skippedBlobGc===false, AND Mac _pollTick after bad start pulls Win session! ---
+  {
+    const subDir = path.join(caseDir, 'wrong-passphrase-recovery');
+    const winHome = path.join(subDir, 'win-home');
+    const macHome = path.join(subDir, 'mac-home');
+    const vaultDir = path.join(subDir, 'vault');
+    const winWs = path.join(subDir, 'win-ws');
+    const macWs = path.join(subDir, 'mac-ws');
+    await fs.mkdir(winWs, { recursive: true });
+    await fs.mkdir(macWs, { recursive: true });
+    await fs.mkdir(vaultDir, { recursive: true });
+
+    const mappings = [{ id: 'rec-proj', title: 'RecProj', win32: winWs, darwin: macWs, linux: macWs }];
+    await savePassphraseKey(winHome, 'true-pass-2026');
+    await savePassphraseKey(macHome, 'wrong-pass-9999');
+    await saveConfig(winHome, {
+      deviceId: 'win-rec',
+      deviceLabel: 'WinRec',
+      platform: 'win32',
+      vaultDir,
+      encryptionEnabled: true,
+      workspaceMappings: mappings,
+    });
+    await saveConfig(macHome, {
+      deviceId: 'mac-rec',
+      deviceLabel: 'MacRec',
+      platform: 'darwin',
+      vaultDir,
+      encryptionEnabled: true,
+      workspaceMappings: mappings,
+    });
+
+    await writeLocalSession(
+      winHome,
+      { type: 'session', version: 4, id: 'sess-win-true', createdAt: 1000, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Win正确口令对话' }] } }],
+    );
+    await writeLocalSession(
+      macHome,
+      { type: 'session', version: 4, id: 'sess-mac-bad', createdAt: 1200, cwd: macWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: 1300, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Mac错口令期间对话' }] } }],
+    );
+
+    const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', minQuietMs: 0, pollIntervalMs: 0 });
+    const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', minQuietMs: 0, pollIntervalMs: 0 });
+    try {
+      await winCtrl.reloadConfig();
+      await winCtrl.pushAll();
+
+      // Mac starts with WRONG passphrase AND writes wrong-key session + global commits
+      await macCtrl.start();
+      await macCtrl.pushAll();
+      assert.equal(macCtrl._seenRemoteCommitFiles.size, 0, '_runStartup must NOT swallow undecryptable remote commits into _seenRemoteCommitFiles');
+
+      // Win currently sees Mac's undecryptable commits
+      const winBadState = await callApi(winCtrl, { method: 'GET', url: '/__soul-sync/api/state', headers: { 'x-dsh-soul-sync': '1' } });
+      assert.ok(winBadState.json.decryptionFailedCount > 0, 'Win should detect Mac wrong-key commits before recovery');
+      assert.ok(winBadState.json.decryptionFailedDevices['mac-rec'] > 0, 'decryptionFailedDevices should attribute mac-rec');
+
+      // Mac fixes passphrase via updateSettings -> purges obsolete own wrong-key commits, re-publishes & syncs!
+      await macCtrl.updateSettings({ passphrase: 'true-pass-2026' });
+
+      // Win now sees decryptionFailedCount === 0 AND pruneHistory runs blob GC cleanly (skippedBlobGc === false)!
+      const winGoodState = await callApi(winCtrl, { method: 'GET', url: '/__soul-sync/api/state', headers: { 'x-dsh-soul-sync': '1' } });
+      assert.equal(winGoodState.json.decryptionFailedCount, 0, 'Win decryptionFailedCount must return to 0 after Mac fixes passphrase');
+      const pruneRes = await winCtrl.vault.pruneHistory('session', 5);
+      assert.equal(pruneRes.skippedBlobGc, false, 'Vault orphan blob GC must resume cleanly after wrong-key own commits purged');
+
+      // Mac has pulled Win's session AND _pollTick sees unconsumed files cleanly
+      const pollRes = await macCtrl._pollTick();
+      assert.equal(pollRes.polled, true);
+      assert.equal(pollRes.pulled, true);
+      const macSessions = await scanLocalSessions(macHome);
+      assert.ok(macSessions.has('sess-win-true'), 'Mac must have pulled Win session after passphrase fix');
+    } finally {
+      await winCtrl.dispose();
+      await macCtrl.dispose();
+    }
+  }
 });

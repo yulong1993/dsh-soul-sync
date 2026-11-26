@@ -412,7 +412,7 @@ test('cross-OS migration & agent/pre-step one-shot injection: Windows -> Encrypt
   };
   const ac = new AbortController();
 
-  // First agent/pre-step -> prepends one-shot first-person cross-OS migration note as native collapsed context notice
+  // First agent/pre-step -> appends one-shot first-person cross-OS migration note as native collapsed context notice
   const decision1 = await macCtx.waterfall(
     'agent/pre-step',
     { agent: mockAgent, signal: ac.signal },
@@ -420,12 +420,12 @@ test('cross-OS migration & agent/pre-step one-shot injection: Windows -> Encrypt
   );
   assert.equal(decision1.kind, 'continue');
   assert.equal(decision1.messages.length, 2);
-  const injected = decision1.messages[0];
+  assert.equal(decision1.messages[0].id, 'm1', 'User original prompt should precede the appended context notice');
+  const injected = decision1.messages[1];
   assert.equal(injected.role, 'user');
   assert.equal(injected.source?.kind, 'dsh-soul-sync');
   assert.equal(injected.source?.form, 'notice');
   assert.equal(injected.source?.summary, '已同步跨设备上下文');
-  assert.equal(decision1.messages[1].id, 'm1', 'User original prompt should follow the prepended context notice');
   assert.ok(Object.isFrozen(injected), 'fallback UserMessage should be deeply frozen');
   const noteText = injected.content[0].text;
   assert.ok(noteText.includes('【跨设备接力备注】'));
