@@ -412,7 +412,7 @@ test('cross-OS migration & agent/pre-step one-shot injection: Windows -> Encrypt
   };
   const ac = new AbortController();
 
-  // First agent/pre-step -> injects one-shot first-person cross-OS migration note
+  // First agent/pre-step -> prepends one-shot first-person cross-OS migration note as native collapsed context notice
   const decision1 = await macCtx.waterfall(
     'agent/pre-step',
     { agent: mockAgent, signal: ac.signal },
@@ -420,8 +420,12 @@ test('cross-OS migration & agent/pre-step one-shot injection: Windows -> Encrypt
   );
   assert.equal(decision1.kind, 'continue');
   assert.equal(decision1.messages.length, 2);
-  const injected = decision1.messages[1];
+  const injected = decision1.messages[0];
   assert.equal(injected.role, 'user');
+  assert.equal(injected.source?.kind, 'dsh-soul-sync');
+  assert.equal(injected.source?.form, 'notice');
+  assert.equal(injected.source?.summary, '已同步跨设备上下文');
+  assert.equal(decision1.messages[1].id, 'm1', 'User original prompt should follow the prepended context notice');
   assert.ok(Object.isFrozen(injected), 'fallback UserMessage should be deeply frozen');
   const noteText = injected.content[0].text;
   assert.ok(noteText.includes('【跨设备接力备注】'));
@@ -816,7 +820,8 @@ test('stepSyncEnabled toggle: default true, disables step/end while keeping turn
   assert.ok(statusOn.text.includes('已开启'));
   assert.ok(statusOn.text.includes('/soul 关闭30秒快照'));
 
-  // Now step/end triggers export!
+  // Now step/end triggers export when new step events exist!
+  events.push({ seq: 1, time: Date.now() + 10, type: 'assistant/message', data: { content: [{ type: 'text', text: 'step 1 中间产出' }] } });
   await ctx.emit('session/event', sessionObj, { type: 'step/end', data: {} });
   assert.equal(ctx._flushCalls.length, 2);
   sessCommits = await vault.listCommits('session', { targetId: sessionId, includeSelf: true });
@@ -1215,7 +1220,8 @@ test('selective sync: syncScope=selected, pushSelected, pullSelected with target
   assert.equal(macLocalCat.workspaces[0].path.toLowerCase(), macCustomTarget.toLowerCase());
 
   const macCfgAfter = await loadConfig(macHome);
-  assert.equal(macCfgAfter.workspaceMappings.length, 1);
+  // Same-OS saveMappings persists into workspaceTargetOverrides (never pollutes cross-OS workspaceMappings!)
+  assert.equal(macCfgAfter.workspaceTargetOverrides[wsA], macCustomTarget);
 
   assert.equal(parseNaturalSoulIntent('list').kind, 'list');
   assert.equal(parseNaturalSoulIntent('看看有哪些对话可以迁移').kind, 'list');

@@ -785,8 +785,12 @@ test.describe('session-plane: true split-brain zero-shift fork & safety guards',
     assert.ok(decodedAfter.header.cwd.toLowerCase().includes('case4-fallback'));
     assert.equal((await fs.stat(decodedAfter.header.cwd)).isDirectory(), true);
 
-    // 4. exportAllLocalSessions skips subagent roots & exports all top-level sessions
-    const exportAllRes = await exportAllLocalSessions({ dshHome: srcHome, vault: srcVault });
+    // 4. exportAllLocalSessions skips unchanged commits by default, and exports with force: true
+    const exportAllDedup = await exportAllLocalSessions({ dshHome: srcHome, vault: srcVault });
+    assert.equal(exportAllDedup.exported.length, 0);
+    assert.equal(exportAllDedup.skippedUnchangedCount, 1);
+
+    const exportAllRes = await exportAllLocalSessions({ dshHome: srcHome, vault: srcVault, force: true });
     assert.equal(exportAllRes.exported.length, 1);
     assert.equal(exportAllRes.exported[0].rootSessionId, sid);
   });

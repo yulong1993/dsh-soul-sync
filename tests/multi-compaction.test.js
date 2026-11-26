@@ -684,7 +684,9 @@ test('Module 4: hasUnclosedCompaction defers mid-compaction snapshot export with
     workspaceMappings: mappings,
     deviceLabel: 'WinGuard',
   });
-  assert.equal(res2.exported.length, 2);
+  assert.equal(res2.exported.length, 1, 'sess-mid-compact should be newly exported once compaction closes');
+  assert.equal(res2.exported[0].rootSessionId, 'sess-mid-compact');
+  assert.equal(res2.skippedUnchangedCount, 1, 'unchanged sess-healthy should skip redundant duplicate vault commit');
   assert.deepEqual(res2.deferredCompactionSessions, []);
 
   const pullRes = await pullSessionsFromVault({

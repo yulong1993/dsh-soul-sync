@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 
 import {
   DEFAULT_QUOTAS,
+  VALID_SYNC_SCOPES,
   GLOBAL_AGENTS_RULES_MARKER,
   resolveDshHome,
   soulSyncDir,
@@ -20,6 +21,9 @@ import {
   loadPassphraseKey,
   ensureGlobalAgentsRules,
   writeFileAtomic,
+  expandPosixHome,
+  extractDirBasename,
+  deriveWorkspaceId,
 } from '../lib/config.js';
 import { scanLocalSessions, pullSessionsFromVault, exportAllLocalSessions } from '../lib/session-plane.js';
 import {
@@ -74,23 +78,6 @@ async function pathExists(targetPath) {
   } catch {
     return false;
   }
-}
-
-function extractDirBasename(rawPath) {
-  if (!rawPath) return '';
-  const cleaned = String(rawPath).trim().replace(/[\\/]+$/, '');
-  const idx = Math.max(cleaned.lastIndexOf('/'), cleaned.lastIndexOf('\\'));
-  return (idx >= 0 ? cleaned.slice(idx + 1) : cleaned).normalize('NFC');
-}
-
-function deriveWorkspaceId(winPath, macPath) {
-  const base = extractDirBasename(winPath) || extractDirBasename(macPath) || 'workspace';
-  const safe = base
-    .normalize('NFC')
-    .replace(/[<>:"/\\|?*\s]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  if (safe.length > 0) return safe;
-  return `ws-${crypto.createHash('sha256').update(`${winPath}::${macPath}`).digest('hex').slice(0, 6)}`;
 }
 
 /**
@@ -164,6 +151,7 @@ function parseArgv(argv) {
     retain: null,
     stepSyncMs: null,
     stepSync: null,
+    scope: null,
     trashDays: null,
     workspace: null,
     onlySessions: [],
@@ -206,6 +194,14 @@ function parseArgv(argv) {
         throw new Error(`参数 --step-sync 仅支持 on/off/true/false/1/0，当前收到：${r.value}`);
       }
       flags.stepSync = parsedBool;
+      i = r.nextIdx;
+    } else if (arg === '--scope' || arg.startsWith('--scope=')) {
+      const r = takeValue(argv, i, '--scope');
+      const normScope = String(r.value ?? '').trim().toLowerCase();
+      if (!VALID_SYNC_SCOPES.includes(normScope)) {
+        throw new Error(`参数 --scope 仅支持 active / selected，当前收到：${r.value}`);
+      }
+      flags.scope = normScope;
       i = r.nextIdx;
     } else if (arg === '--force') {
       flags.force = true;
@@ -361,6 +357,7 @@ function formatHelpText() {
     '  catalog   盘点本机与金库中所有可迁移的工作区与对话清单（过滤空窗口）',
     '  push      备份本地会话闭包、AGENTS.md 与产出物（支持 --only-workspace / --only-session 按需推送）',
     '  pull      从金库恢复/三路合并会话与产出物（支持 --only-workspace / --only-session / --target / --force）',
+    '  unpublish 从金库撤回指定会话（删除金库提交、回收孤儿块并加入屏蔽清单）',
     '  keep      将指定文件手动纳入《产出账本》并立即推送至防灾金库',
     '  config    查看或修改同步配额、文件夹对应模式（folderMatchMode）与同步范围（syncScope）',
     '  doctor    全面自检配置、金库读写、密钥、技能、规则块与 DSH 插件注册状态',
@@ -433,9 +430,16 @@ async function runInit(flags, dshHome, io) {
     return 1;
   }
 
-  const resolvedVaultDir = await ensureVaultStructure(vaultDir);
+  const expandedVaultDir = expandPosixHome(vaultDir.trim(), io.platform);
+  const resolvedVaultDir = await ensureVaultStructure(expandedVaultDir);
 
-  const parsedMaps = mapSpecs.map((spec) => parseWorkspaceMappingSpec(spec));
+  const parsedMaps = mapSpecs.map((spec) => {
+    const parsed = parseWorkspaceMappingSpec(spec);
+    if (parsed.darwin && (parsed.darwin === '~' || parsed.darwin.startsWith('~/')) && io.platform !== 'win32') {
+      parsed.darwin = expandPosixHome(parsed.darwin, io.platform).normalize('NFC');
+    }
+    return { ...parsed, updatedAt: Date.now() };
+  });
   const mergedMappings = mergeWorkspaceMappings(existing.workspaceMappings, parsedMaps);
 
   const quotasPatch = {};
@@ -470,6 +474,7 @@ async function runInit(flags, dshHome, io) {
     platform: io.platform,
     encryptionEnabled,
     stepSyncEnabled,
+    ...(flags.scope !== null ? { syncScope: flags.scope } : {}),
     workspaceMappings: mergedMappings,
     ...(flags.fallbackDir !== null ? { fallbackDir: flags.fallbackDir ? path.resolve(flags.fallbackDir) : '' } : {}),
     quotas: quotasPatch,
@@ -478,7 +483,7 @@ async function runInit(flags, dshHome, io) {
   const agentsRes = await ensureGlobalAgentsRules(dshHome);
   const skillDest = await syncHandoffSkill(dshHome);
 
-  // Initialize controller to write initial device heartbeat into vault
+  // Initialize controller to write initial device heartbeat & sync global workspace mappings into vault
   const controller = new SoulSyncController(null, {
     dshHome,
     platform: io.platform,
@@ -486,6 +491,9 @@ async function runInit(flags, dshHome, io) {
   });
   await controller.reloadConfig();
   if (controller.vault) {
+    if (mergedMappings.length > 0) {
+      await controller.syncGlobalWorkspaceMetadata({ publishLocal: true }).catch(() => {});
+    }
     await controller.updateHeartbeat({ status: 'initialized' });
   }
 
@@ -799,6 +807,26 @@ async function runPull(flags, dshHome, io) {
   if (totalStaged > 0) {
     io.out(`⚠️ 有 ${totalStaged} 个文件因本地 Excel/Office 占锁已暂存于 .dsh-incoming/，关闭软件后再次运行 dsh-soul pull 即可自动落位。`);
   }
+  return 0;
+}
+
+async function runUnpublish(args, dshHome, io) {
+  if (!args || args.length === 0) {
+    io.err('用法：dsh-soul unpublish <会话ID或短ID...>');
+    return 1;
+  }
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+  });
+  await controller.reloadConfig();
+  const res = await controller.handleUnpublish({ targets: args });
+  if (res.kind === 'error') {
+    io.err(`错误：${res.text}`);
+    return 1;
+  }
+  io.out(res.text);
   return 0;
 }
 
@@ -1200,6 +1228,8 @@ export async function runCli(argv = [], ioOverrides = {}) {
         return await runPush(flags, dshHome, io);
       case 'pull':
         return await runPull(flags, dshHome, io);
+      case 'unpublish':
+        return await runUnpublish(subArgs, dshHome, io);
       case 'keep':
         return await runKeep(flags, subArgs, dshHome, io);
       case 'config':
