@@ -1426,6 +1426,36 @@ test('Release-Gate: Neon P0 #1 (UI payload C2 guard), P0 #3 (CLI init/doctor wro
     const winStatsAfter = await winCtrl.vault.countReadableDeviceStats();
     assert.equal(winStatsAfter.ownSessionCount, 5, 'Neon P0 #1: all 5 good Win session commits MUST stay intact');
 
+    // 1b. Neon CHK2B: Switching to a DIFFERENT encrypted peer vault `vaultB` with a wrong passphrase
+    //     MUST roll back `vaultDir` (staying on original vaultA) and NEVER pollute `vaultB`!
+    const vaultB = path.join(caseDir, 'vault-b');
+    const peerBHome = path.join(caseDir, 'peer-b-home');
+    await fs.mkdir(vaultB, { recursive: true });
+    await savePassphraseKey(peerBHome, 'VAULT_B_SECRET');
+    await saveConfig(peerBHome, { deviceId: 'peer-b', deviceLabel: 'PeerB', platform: 'darwin', vaultDir: vaultB, encryptionEnabled: true });
+    await writeLocalSession(
+      peerBHome,
+      { type: 'session', version: 4, id: 'sess-vault-b-1', createdAt: now - 3000, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+      [{ seq: 0, time: now - 2900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Vault B secret session' }] } }],
+    );
+    const peerBCtrl = new SoulSyncController(null, { dshHome: peerBHome, platform: 'darwin', pollIntervalMs: 0 });
+    await peerBCtrl.reloadConfig();
+    await peerBCtrl.pushAll();
+    const switchBadRes = await winCtrl.updateSettings({
+      vaultDir: vaultB,
+      passphrase: 'WRONG_FOR_VAULT_B',
+    });
+    assert.equal(switchBadRes.keyUpdateBlocked, true, 'Neon CHK2B: switching to encrypted vaultB with wrong passphrase must be blocked');
+    assert.equal(switchBadRes.requiresKeyRotationConfirm, true);
+    assert.equal(
+      path.resolve(winCtrl.config.vaultDir).toLowerCase(),
+      path.resolve(vaultDir).toLowerCase(),
+      'Neon CHK2B: vaultDir MUST roll back to original vaultA when passphrase is blocked',
+    );
+    const vaultBStatsAfter = await peerBCtrl.vault.countReadableDeviceStats();
+    assert.equal(vaultBStatsAfter.peerFailedCount, 0, 'Neon CHK2B: vaultB MUST NOT be polluted by blocked switch');
+    await peerBCtrl.dispose();
+
     // 2. Neon P0 #3: `dsh-soul init --map ... --passphrase WRONG` MUST fail with exit 1 without polluting vault,
     //    AND `dsh-soul doctor` MUST fail (`[FAIL] vault-decrypt`, exit 1) when peer commits fail even if own commit decrypts!
     const macInitHome = path.join(caseDir, 'mac-init-wrong');
@@ -1447,10 +1477,12 @@ test('Release-Gate: Neon P0 #1 (UI payload C2 guard), P0 #3 (CLI init/doctor wro
     assert.equal(docCode, 1, 'Neon P0 #3: doctor must exit 1 when all peer commits fail decryption');
     assert.match(docOut.join(''), /\[FAIL\] vault-decrypt/);
 
-    // 3. Opus P1 Legacy Probe C: Un-timestamped legacy mapping ID `"文章"` MUST NOT be overwritten by peer's `"文章-xxxx"`!
+    // 3. Opus P1 Legacy Probe C + F8c: Un-timestamped legacy mapping ID `"文章"` MUST be preserved on Win
+    //    AND Mac (both offline `handleAddMapping` AND fresh `dsh-soul init --map`) MUST converge to `["文章"]`!
     const legacyVault = path.join(caseDir, 'legacy-vault');
     const legWinHome = path.join(caseDir, 'leg-win');
     const legMacHome = path.join(caseDir, 'leg-mac');
+    const legMacCliHome = path.join(caseDir, 'leg-mac-cli');
     await fs.mkdir(legacyVault, { recursive: true });
     await saveConfig(legWinHome, {
       deviceId: 'leg-win',
@@ -1471,34 +1503,71 @@ test('Release-Gate: Neon P0 #1 (UI payload C2 guard), P0 #3 (CLI init/doctor wro
     await legMacCtrl.reloadConfig();
     await legMacCtrl.handleAddMapping({ winPath: winWs, macPath: macWs, triggerPull: false });
     assert.match(legMacCtrl.config.workspaceMappings[0].id, /^文章-[0-9a-f]{4}$/);
-    await legWinCtrl.syncGlobalWorkspaceMetadata();
+    await legWinCtrl.syncGlobalWorkspaceMetadata({ publishLocal: true });
     assert.deepEqual(
       legWinCtrl.config.workspaceMappings.map((m) => m.id),
       ['文章'],
       'Opus P1 Legacy Probe C: established legacy ID "文章" must be preserved against peer hashed ID',
     );
+    // Opus F8c: Mac syncs with Win -> Mac MUST converge from `"文章-xxxx"` to canonical `"文章"`!
+    await legMacCtrl.syncGlobalWorkspaceMetadata();
+    assert.deepEqual(
+      legMacCtrl.config.workspaceMappings.map((m) => m.id),
+      ['文章'],
+      'Opus F8c: Mac must deterministically converge to canonical legacy ID "文章" so deliverables sync across both devices',
+    );
+    // Opus F8c CLI path: fresh Mac running `dsh-soul init --map winWs::macWs` immediately reuses `"文章"`!
+    const cliInitOut = [];
+    const cliInitCode = await runCli(
+      ['--dsh-home', legMacCliHome, '--platform', 'darwin', 'init', '--non-interactive', '--vault', legacyVault, '--no-passphrase', '--map', `${winWs}::${macWs}`],
+      { stdout: (s) => cliInitOut.push(s), stderr: (s) => cliInitOut.push(s) },
+    );
+    assert.equal(cliInitCode, 0, cliInitOut.join(''));
+    assert.deepEqual(
+      (await loadConfig(legMacCliHome)).workspaceMappings.map((m) => m.id),
+      ['文章'],
+      'Opus F8c: fresh Mac `dsh-soul init --map` must immediately adopt canonical peer ID "文章"',
+    );
 
-    // 4. Neon P1 #5: `withdrawUnselected` MUST NOT trap sessions when switching back to `syncScope: 'active'`!
+    // 4. Opus G2 + Neon CHK5A: `withdrawUnselected` stops a `selected`-mode peer from re-pushing Win's session,
+    //    AND switching back to `syncScope: 'active'` (via updateSettings or `/soul scope active`) resumes syncing!
     await writeLocalSession(
       legWinHome,
       { type: 'session', version: 4, id: 'sess-unselected-recover', createdAt: now - 2000, cwd: winWs, isSeeded: false, delegationDepth: 0 },
       [{ seq: 0, time: now - 1900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Recoverable session' }] } }],
     );
     await legWinCtrl.pushAll();
+    // Mac in `selected` mode pulls and selects Win's session
+    await legMacCtrl.updateSettings({ syncScope: 'selected', selectedSessionIds: ['sess-unselected-recover'] });
+    await legMacCtrl.pullAll();
+    // Win switches to `selected` and withdraws its unselected own session
     await legWinCtrl.updateSettings({
       syncScope: 'selected',
       selectedSessionIds: [],
       selectedWorkspaces: [],
       withdrawUnselected: true,
     });
-    assert.equal((legWinCtrl.config.withdrawnSessions ?? {})['sess-unselected-recover'], undefined, 'Neon P1 #5: withdrawUnselected must not write permanent withdrawnSessions tombstone');
-    await legWinCtrl.updateSettings({ syncScope: 'active' });
+    assert.equal((legWinCtrl.config.excludedSessionIds ?? []).includes('sess-unselected-recover'), false, 'withdrawUnselected must NOT permanently exclude');
+    assert.ok((legWinCtrl.config.withdrawnSessions ?? {})['sess-unselected-recover'] > 0, 'Opus G2: withdrawUnselected must broadcast withdrawal timestamp to peers');
+    // Mac syncs metadata and pushes -> MUST NOT re-push Win's withdrawn session!
+    await legMacCtrl.syncGlobalWorkspaceMetadata();
+    assert.equal((legMacCtrl.config.selectedSessionIds ?? []).includes('sess-unselected-recover'), false, 'Opus G2: selected-mode peer must drop withdrawn session from selectedSessionIds');
+    await legMacCtrl.pushAll();
+    const vaultAfterMacPush = await legWinCtrl.vault.listCommits('session');
+    assert.equal(
+      vaultAfterMacPush.commits.some((c) => c.targetId === 'sess-unselected-recover'),
+      false,
+      'Opus G2: selected-mode peer must NOT re-push withdrawn session back into vault',
+    );
+    // Win switches back to `active` via `/soul scope active` -> MUST restore and resume pushing!
+    const scopeRes = await legWinCtrl.handleSetScope({ scope: 'active' });
+    assert.equal(scopeRes.kind, 'success');
     const backActivePush = await legWinCtrl.pushAll();
     const vaultAfterBackActive = await legWinCtrl.vault.listCommits('session');
     assert.ok(
       backActivePush.sessionPushedCount >= 1
       && vaultAfterBackActive.commits.some((c) => c.targetId === 'sess-unselected-recover'),
-      'Neon P1 #5: switching back to syncScope=active must resume syncing previously unselected session',
+      'Neon CHK5A: switching back to syncScope=active must resume syncing previously unselected session',
     );
 
     // 5. Neon P2 #6: `OPTIONS` checks `connection.requestRejection` BEFORE 204 and never reflects `dsh-app://app`

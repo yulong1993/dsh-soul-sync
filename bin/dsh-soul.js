@@ -154,7 +154,9 @@ function mergeWorkspaceMappings(existingList, additions) {
       }
     }
     if (idx !== -1) {
-      result[idx] = { ...result[idx], ...m, id: result[idx].id };
+      const prevTs = typeof result[idx].updatedAt === 'number' && Number.isFinite(result[idx].updatedAt) ? result[idx].updatedAt : 0;
+      const nextTs = typeof m.updatedAt === 'number' && Number.isFinite(m.updatedAt) ? m.updatedAt : prevTs;
+      result[idx] = { ...result[idx], ...m, id: result[idx].id, updatedAt: Math.min(prevTs, nextTs) };
     } else {
       result.push({ ...m });
     }
@@ -465,15 +467,6 @@ async function runInit(flags, dshHome, io) {
   const expandedVaultDir = expandPosixHome(vaultDir.trim(), io.platform);
   const resolvedVaultDir = await ensureVaultStructure(expandedVaultDir);
 
-  const parsedMaps = mapSpecs.map((spec) => {
-    const parsed = parseWorkspaceMappingSpec(spec);
-    if (parsed.darwin && (parsed.darwin === '~' || parsed.darwin.startsWith('~/')) && io.platform !== 'win32') {
-      parsed.darwin = expandPosixHome(parsed.darwin, io.platform).normalize('NFC');
-    }
-    return { ...parsed, updatedAt: Date.now() };
-  });
-  const mergedMappings = mergeWorkspaceMappings(existing.workspaceMappings, parsedMaps);
-
   const quotasPatch = {};
   if (flags.maxFileMB !== null) {
     quotasPatch.maxFileBytes = Math.round(parsePositiveNumber(flags.maxFileMB, '--max-file-mb') * 1024 * 1024);
@@ -503,14 +496,14 @@ async function runInit(flags, dshHome, io) {
     : passphrase !== null
       ? derivePassphraseKey(passphrase)
       : await loadPassphraseKey(dshHome).catch(() => null);
+  const preProbeVault = new VaultStore({
+    vaultDir: resolvedVaultDir,
+    deviceId: existing.deviceId,
+    platform: io.platform,
+    secretKeys: candidateKeys,
+    quotas: { ...(existing.quotas ?? {}), ...quotasPatch },
+  });
   if (!flags.forceRotate) {
-    const preProbeVault = new VaultStore({
-      vaultDir: resolvedVaultDir,
-      deviceId: existing.deviceId,
-      platform: io.platform,
-      secretKeys: candidateKeys,
-      quotas: { ...(existing.quotas ?? {}), ...quotasPatch },
-    });
     const preStats = await preProbeVault.countReadableDeviceStats().catch(() => null);
     if (
       preStats
@@ -525,6 +518,42 @@ async function runInit(flags, dshHome, io) {
       return 1;
     }
   }
+
+  // Opus F8c: Pull existing readable remote `workspace-mappings` from vault BEFORE building `--map`
+  // entries so `init --map` immediately reuses canonical/legacy IDs (e.g., `"文章"`) from peers!
+  let seedMappings = existing.workspaceMappings ?? [];
+  try {
+    const remoteMeta = await preProbeVault.listCommits('global', { targetId: 'workspace-mappings', includeSelf: false });
+    const latestRemoteByDev = new Map();
+    for (const c of remoteMeta.commits ?? []) {
+      latestRemoteByDev.set(c.deviceId, c);
+    }
+    const remoteSeed = [];
+    for (const c of latestRemoteByDev.values()) {
+      const deletedMap = c.payload?.deletedMappingIds ?? {};
+      for (const rm of c.payload?.workspaceMappings ?? []) {
+        if (!rm?.id) continue;
+        const rmTs = typeof rm.updatedAt === 'number' && Number.isFinite(rm.updatedAt) ? rm.updatedAt : 0;
+        const delTs = Number(deletedMap[rm.id] ?? 0);
+        if (delTs > (rmTs > 0 ? rmTs : Number(c.timestamp ?? 0))) continue;
+        remoteSeed.push({ ...rm, updatedAt: rmTs });
+      }
+    }
+    if (remoteSeed.length > 0) {
+      seedMappings = mergeWorkspaceMappings(remoteSeed, seedMappings);
+    }
+  } catch {
+    // Non-fatal: syncGlobalWorkspaceMetadata below will still converge deterministically
+  }
+
+  const parsedMaps = mapSpecs.map((spec) => {
+    const parsed = parseWorkspaceMappingSpec(spec);
+    if (parsed.darwin && (parsed.darwin === '~' || parsed.darwin.startsWith('~/')) && io.platform !== 'win32') {
+      parsed.darwin = expandPosixHome(parsed.darwin, io.platform).normalize('NFC');
+    }
+    return { ...parsed, updatedAt: Date.now() };
+  });
+  const mergedMappings = mergeWorkspaceMappings(seedMappings, parsedMaps);
 
   let encryptionEnabled = existing.encryptionEnabled;
   if (clearPassphrase || (passphrase !== null && passphrase === '')) {
@@ -558,11 +587,10 @@ async function runInit(flags, dshHome, io) {
   });
   await controller.reloadConfig();
   if (controller.vault) {
-    if (mergedMappings.length > 0) {
-      await controller.syncGlobalWorkspaceMetadata({ publishLocal: true }).catch(() => {});
-    }
+    await controller.syncGlobalWorkspaceMetadata({ publishLocal: mergedMappings.length > 0 }).catch(() => {});
     await controller.updateHeartbeat({ status: 'initialized' });
   }
+  const finalMappings = controller.config?.workspaceMappings ?? saved.workspaceMappings;
 
   io.out('初始化完成！');
   io.out(`- DSH 目录: ${dshHome}`);
@@ -570,8 +598,8 @@ async function runInit(flags, dshHome, io) {
   io.out(`- 加密模式: ${saved.encryptionEnabled ? 'AES-256-GCM 已开启（密钥仅保存在本机 soul-sync/secret.key，绝不进入金库）' : '明文模式'}`);
   io.out(`- 步级快照: ${saved.stepSyncEnabled !== false ? '已开启（运行中每 30 秒自动防断电快照）' : '已关闭（仅在每轮对话结束时安全同步）'}`);
   io.out(`- 设备身份: ${saved.deviceLabel} (${saved.deviceId} / ${io.platform})`);
-  io.out(`- 工作区映射: ${saved.workspaceMappings.length} 个`);
-  for (const m of saved.workspaceMappings) {
+  io.out(`- 工作区映射: ${finalMappings.length} 个`);
+  for (const m of finalMappings) {
     io.out(`    · [${m.id}] Win=${m.win32 || '(未设)'} ⇄ Mac=${m.darwin || '(未设)'}`);
   }
   io.out(`- 全局规则: ${agentsRes.path}`);
