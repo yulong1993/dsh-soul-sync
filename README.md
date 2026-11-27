@@ -27,17 +27,20 @@
 
 > 小贴士：建议右键这个金库文件夹，勾选 **「始终保留在此设备上 / Always keep on this device」**，避免网盘自动清理缓存导致换机时还要等下载。
 
-### 方法 A（最推荐 · 零命令行）：复制一段话发给 DSH，让 AI 自己帮你装
+### 方法 A（最推荐 · 零命令行 · 无需装 Git）：复制一段话发给 DSH，让 AI 从 GitHub 全自动帮你装
 
-**完全不需要打开终端或记任何命令！** 打开 DeepSeek Harness，把 **[INSTALL_PROMPT.md](./INSTALL_PROMPT.md)** 里的全自动安装提示词复制发给 AI（也可直接复制下面这段精简指令）：
+**完全不需要打开终端、不需要装 Git、连压缩包都不用手动下载！**
+非技术同事可直接阅读 **[《同事零基础上手说明书（COLLEAGUE_GUIDE.md）》](./COLLEAGUE_GUIDE.md)**，或直接打开 DeepSeek Harness 新建对话，把 **[INSTALL_PROMPT.md](./INSTALL_PROMPT.md)** 里的提示词发给 AI（也可复制下面这段精简版）：
 
 ```text
-请读取当前（或我指定路径的）dsh-soul-sync 目录里的 INSTALL_PROMPT.md，
-按里面的 4 步向导，用大白话一次性向我确认网盘金库路径和是否设置加密口令（也可装好重启后在图形面板密码框里再填），
-然后自动识别我的操作系统替我跑完安装脚本并核对 doctor 体检通过。
+请你帮我从公开仓库 https://github.com/yulong1993/dsh-soul-sync 全自动下载、安装并配置 DeepSeek Harness 跨电脑同步插件（dsh-soul-sync）：
+1. 先把它下载到我的「文档」固定目录 dsh-soul-sync（有 git 用 git clone；没装 git 在 Windows 用 curl.exe -L、macOS 用 curl -L 下载 https://codeload.github.com/yulong1993/dsh-soul-sync/tar.gz/refs/heads/main 并用 tar -xzf 解压）；
+2. 读取里面的 INSTALL_PROMPT.md，按 4 步向导用大白话向我确认「网盘金库文件夹路径」和「是否设置加密口令」，自动替我运行安装脚本并核对 doctor 体检通过。
 ```
 
-回答 AI 问你的 **2 个核心问题**后，等它报「体检通过」，**重启一次 DeepSeek Harness** 就能直接用！另一台电脑重复发同一段话、填同一个网盘金库和同一个口令即可（若日后移动了 `dsh-soul-sync` 文件夹位置，重跑一次安装脚本即可恢复挂载）。
+回答 AI 问你的 **2 个大白话问题**后，等它报「体检通过」，**重启一次 DeepSeek Harness** 就能直接用！
+- **配对第二台电脑**：在第一台电脑打开左下角 **「设置 → Soul Sync 跨机迁移」**，点 **`📲 配对另一台电脑` → `📋 一键复制配对提示词`** 发到另一台电脑粘贴即可。
+- **日后一键升级**：随时在 **「设置 → Soul Sync 跨机迁移」** 右上角点 **`⬆️ 检查更新` → `🚀 立即一键更新`**（无需安装 Git），重启一次软件即刻生效。
 
 ---
 
@@ -151,7 +154,7 @@ bash ./scripts/install-mac.sh \
 
 ## 6. 配额调整与命令速查表
 
-默认安全配额：单文件上限 **30 MB**、单工作区上限 **500 MB**、历史版本保留 **10 份**、步级防灾快照 **默认开启（30 秒节流，可独立关闭）**、软删除回收站保留 **14 天**。你可以随时用自然语言或参数命令动态修改，不用重启。
+默认安全配额：已绑定映射工作区单文件上限 **50 MB**（未绑定映射的自动同名工作区同步 `outputs/` 单文件 ≤ **10 MB**、单对话 ≤ **30 MB**）、单工作区上限 **500 MB**、历史版本保留 **10 份**、步级防灾快照 **默认开启（30 秒节流，可独立关闭）**、软删除回收站保留 **14 天**。你可以随时用自然语言或参数命令动态修改，不用重启。
 
 ### A. DeepSeek Harness 对话框内 `/soul` 指令（支持大白话 + 精确子命令）
 
@@ -185,6 +188,7 @@ bash ./scripts/install-mac.sh \
 | `dsh-soul config [key=value ...]` | 查看或修改 `stepSync`、`stepSyncEnabled`、`maxFileMB`、`maxWorkspaceMB`、`retainSnapshots`、`stepSyncIntervalMs`、`trashRetentionDays`、`deviceLabel`、`vaultDir` |
 | `dsh-soul doctor` | 全面自检配置、金库可读写性、加密密钥、技能、规则块与 DSH 插件注册状态 |
 | `dsh-soul watch [--interval-ms 60000]` | 启动轻量级后台守护进程，定时备份会话与监听工作区产出物变更 |
+| `dsh-soul update` | 一键在线检查并更新插件至 GitHub 最新版（同时支持 Git 快进与零 Git 压缩包覆盖） |
 | `dsh-soul disconnect` | 断开当前金库连接并暂停同步（100% 保留本机对话与文件） |
 | `dsh-soul reset` | 重置本机 `soul-sync` 配置与密钥（100% 保留本机对话、文件与凭据） |
 | `dsh-soul uninstall` | 一键彻底卸载插件注册、技能、规则块与本机同步配置（100% 保留本机对话、文件、凭据与插件源目录） |
