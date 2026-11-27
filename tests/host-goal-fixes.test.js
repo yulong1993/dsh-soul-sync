@@ -1619,3 +1619,110 @@ test('Release-Gate: Neon P0 #1 (UI payload C2 guard), P0 #3 (CLI init/doctor wro
     await macCtrl.dispose();
   }
 });
+
+test('UX Hardening: vaultDir cannot be bound as project workspace, listLocalCatalog flags isVaultDir & mappedPeerPath, and client.js renders cleanly', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'ux-vault-guard');
+  const dshHome = path.join(caseDir, 'home');
+  const parentDir = path.join(caseDir, 'cloud', 'Nutstore');
+  const vaultDir = path.join(parentDir, 'DSH-Vault');
+  const winArticle = path.join(caseDir, 'projects', '文章');
+  await fs.mkdir(vaultDir, { recursive: true });
+  await fs.mkdir(winArticle, { recursive: true });
+
+  await saveConfig(dshHome, {
+    deviceId: 'win-ux',
+    deviceLabel: 'xuanyuan',
+    platform: 'win32',
+    vaultDir,
+    workspaceMappings: [
+      { id: '文章', title: '文章', win32: winArticle, darwin: '/Users/mingkun/文章' },
+    ],
+  });
+
+  // Create one session accidentally opened inside vaultDir and one inside mapped winArticle
+  const now = Date.now();
+  await writeLocalSession(
+    dshHome,
+    { type: 'session', version: 4, id: 'sess-in-vault', createdAt: now - 5000, cwd: vaultDir, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: now - 4000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '误在金库里开的对话' }] } }],
+  );
+  await writeLocalSession(
+    dshHome,
+    { type: 'session', version: 4, id: 'sess-in-article', createdAt: now - 2000, cwd: winArticle, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: now - 1000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '公众号文章构思' }] } }],
+  );
+
+  const ctrl = new SoulSyncController(null, { dshHome, platform: 'win32', pollIntervalMs: 0 });
+  await ctrl.reloadConfig();
+  try {
+    // 1. Attempting to bind vaultDir (or subdir / parent of vaultDir) as a workspace mapping is rejected cleanly
+    const exactVaultMap = await ctrl.handleAddMapping({
+      winPath: vaultDir,
+      macPath: '/Users/mingkun/Nutstore Files/DSH-Vault',
+      triggerPull: false,
+    });
+    assert.equal(exactVaultMap.kind, 'error');
+    assert.match(exactVaultMap.text, /防灾金库目录.*更换金库 \/ 修改口令/);
+
+    const parentVaultMap = await ctrl.handleAddMapping({
+      winPath: parentDir,
+      macPath: '/Users/mingkun/Nutstore Files',
+      triggerPull: false,
+    });
+    assert.equal(parentVaultMap.kind, 'error');
+    assert.match(parentVaultMap.text, /包含了当前的「防灾金库目录/);
+
+    const apiMapRes = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/mappings',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1', 'content-type': 'application/json' },
+      body: { winPath: vaultDir, macPath: '/Users/mingkun/Nutstore Files/DSH-Vault' },
+    });
+    assert.equal(apiMapRes.status, 400);
+    assert.match(apiMapRes.json?.error || '', /更换金库 \/ 修改口令/);
+
+    // 2. listLocalCatalog marks vaultDir session group with isVaultDir: true & mappingId: null,
+    //    and mapped workspace with isVaultDir: false & mappedPeerPath: '/Users/mingkun/文章'
+    const stateRes = await callApi(ctrl, {
+      method: 'GET',
+      url: '/__soul-sync/api/state',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+    });
+    assert.equal(stateRes.status, 200);
+    const wsGroups = stateRes.json.localCatalog.workspaces;
+    const vaultGroup = wsGroups.find((w) => w.path === vaultDir);
+    const articleGroup = wsGroups.find((w) => w.path === winArticle);
+    assert.ok(vaultGroup, 'vault session group should exist in localCatalog');
+    assert.equal(vaultGroup.isVaultDir, true);
+    assert.equal(vaultGroup.mappingId, null);
+    assert.ok(articleGroup, 'mapped article workspace should exist in localCatalog');
+    assert.equal(articleGroup.isVaultDir, false);
+    assert.equal(articleGroup.mappingId, '文章');
+    assert.equal(articleGroup.mappedPeerPath, '/Users/mingkun/文章');
+
+    // 3. Verify client.js bundle parses cleanly and renders new UX affordances without runtime errors
+    const vm = await import('node:vm');
+    const clientCode = await fs.readFile(path.join(REPO_ROOT, 'lib', 'client.js'), 'utf8');
+    let registeredFactory = null;
+    const sandbox = {
+      window: {
+        __ModuleLoader__: {
+          load(spec) {
+            registeredFactory = spec.factory;
+          },
+        },
+      },
+      navigator: { platform: 'Win32', userAgent: 'Windows' },
+      document: undefined,
+      fetch: async () => ({ ok: true, status: 200, text: async () => JSON.stringify(stateRes.json) }),
+    };
+    vm.runInNewContext(clientCode, sandbox, { filename: 'lib/client.js' });
+    assert.equal(typeof registeredFactory, 'function');
+    assert.match(clientCode, /更换金库 \/ 修改口令/);
+    assert.match(clientCode, /📲 配对另一台电脑/);
+    assert.match(clientCode, /一键复制发给另一台电脑 DSH 的安装配对指令/);
+    assert.match(clientCode, /!ws\.mappingId && !ws\.isVaultDir && ws\.path/);
+  } finally {
+    await ctrl.dispose();
+  }
+});
