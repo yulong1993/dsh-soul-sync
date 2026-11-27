@@ -25,6 +25,10 @@ import {
   expandPosixHome,
   extractDirBasename,
   deriveWorkspaceId,
+  stripOuterQuotes,
+  validateVaultDirectory,
+  validateWorkspaceDirectory,
+  uninstallPluginFromDshHome,
 } from '../lib/config.js';
 import { scanLocalSessions } from '../lib/session-plane.js';
 import { VaultStore } from '../lib/crypto-vault.js';
@@ -95,15 +99,15 @@ export function parseWorkspaceMappingSpec(rawSpec) {
     throw new Error(`无效的工作区映射「${spec}」，必须包含 "::" 分隔 Windows 与 macOS 路径`);
   }
 
-  const leftPart = spec.slice(0, sepIdx).trim();
-  const rightPart = spec.slice(sepIdx + 2).trim();
+  const leftPart = stripOuterQuotes(spec.slice(0, sepIdx));
+  const rightPart = stripOuterQuotes(spec.slice(sepIdx + 2));
 
   let id = '';
   let winPath = leftPart;
   const eqIdx = leftPart.indexOf('=');
   if (eqIdx > 0 && !leftPart.slice(0, eqIdx).includes('\\') && !leftPart.slice(0, eqIdx).includes('/') && !leftPart.slice(0, eqIdx).includes(':')) {
     id = leftPart.slice(0, eqIdx).trim();
-    winPath = leftPart.slice(eqIdx + 1).trim();
+    winPath = stripOuterQuotes(leftPart.slice(eqIdx + 1));
   }
 
   const macPath = rightPart;
@@ -396,6 +400,9 @@ function formatHelpText() {
     '  config    查看或修改同步配额、文件夹对应模式（folderMatchMode）与同步范围（syncScope）',
     '  doctor    全面自检配置、金库读写、密钥、技能、规则块与 DSH 插件注册状态',
     '  watch     启动轻量级后台守护模式，自动监测并周期备份会话与产出物',
+    '  disconnect 断开当前防灾金库连接并暂停同步（保留本机对话与文件）',
+    '  reset     重置本机 soul-sync 配置与密钥（保留本机对话、文件与凭据）',
+    '  uninstall 一键卸载插件注册、技能、规则块与本机配置（绝不删本机对话、文件与插件源目录）',
     '',
     '常用示例：',
     '  dsh-soul init --non-interactive --vault "D:\\OneDrive\\dsh-vault" --passphrase "我的口令" --map "us=D:\\美股分析::/Users/me/美股分析" [--no-step-sync]',
@@ -459,13 +466,22 @@ async function runInit(flags, dshHome, io) {
     }
   }
 
-  if (!vaultDir || !vaultDir.trim()) {
+  const cleanVaultDir = stripOuterQuotes(vaultDir);
+  if (!cleanVaultDir) {
     io.err('错误：请通过 --vault <dir> 指定网盘防灾金库目录。');
     return 1;
   }
 
-  const expandedVaultDir = expandPosixHome(vaultDir.trim(), io.platform);
-  const resolvedVaultDir = await ensureVaultStructure(expandedVaultDir);
+  const vaultHostPlatform = io.platform === process.platform ? io.platform : process.platform;
+  const vaultVal = validateVaultDirectory(cleanVaultDir, vaultHostPlatform, {
+    dshHome,
+    workspaceMappings: existing.workspaceMappings ?? [],
+  });
+  if (!vaultVal.ok) {
+    io.err(`错误：${vaultVal.error}`);
+    return 1;
+  }
+  const resolvedVaultDir = await ensureVaultStructure(vaultVal.normalizedPath);
 
   const quotasPatch = {};
   if (flags.maxFileMB !== null) {
@@ -546,13 +562,37 @@ async function runInit(flags, dshHome, io) {
     // Non-fatal: syncGlobalWorkspaceMetadata below will still converge deterministically
   }
 
-  const parsedMaps = mapSpecs.map((spec) => {
+  const parsedMaps = [];
+  for (const spec of mapSpecs) {
     const parsed = parseWorkspaceMappingSpec(spec);
-    if (parsed.darwin && (parsed.darwin === '~' || parsed.darwin.startsWith('~/')) && io.platform !== 'win32') {
-      parsed.darwin = expandPosixHome(parsed.darwin, io.platform).normalize('NFC');
+    if (parsed.win32) {
+      const wv = validateWorkspaceDirectory(parsed.win32, 'win32', {
+        dshHome: io.platform === 'win32' ? dshHome : undefined,
+        vaultDir: io.platform === 'win32' ? resolvedVaultDir : undefined,
+      });
+      if (!wv.ok) {
+        io.err(`错误：${wv.error}`);
+        return 1;
+      }
+      parsed.win32 = wv.normalizedPath;
     }
-    return { ...parsed, updatedAt: Date.now() };
-  });
+    if (parsed.darwin) {
+      const macCheckPlatform =
+        process.platform === 'win32' && (/^[A-Za-z]:[\\/]/.test(parsed.darwin) || /^\\\\/.test(parsed.darwin))
+          ? 'win32'
+          : 'darwin';
+      const mv = validateWorkspaceDirectory(parsed.darwin, macCheckPlatform, {
+        dshHome: macCheckPlatform === process.platform ? dshHome : undefined,
+        vaultDir: macCheckPlatform === process.platform ? resolvedVaultDir : undefined,
+      });
+      if (!mv.ok) {
+        io.err(`错误：${mv.error}`);
+        return 1;
+      }
+      parsed.darwin = mv.normalizedPath;
+    }
+    parsedMaps.push({ ...parsed, updatedAt: Date.now() });
+  }
   const mergedMappings = mergeWorkspaceMappings(seedMappings, parsedMaps);
 
   let encryptionEnabled = existing.encryptionEnabled;
@@ -773,8 +813,8 @@ async function runPull(flags, dshHome, io) {
       io.err(`无效的 --target 参数「${spec}」，格式应为 <源路径或会话ID>::<本机目标目录>`);
       return 1;
     }
-    const srcKey = spec.slice(0, sep).trim();
-    const dstDir = spec.slice(sep + 2).trim();
+    const srcKey = stripOuterQuotes(spec.slice(0, sep));
+    const dstDir = stripOuterQuotes(spec.slice(sep + 2));
     if (srcKey && dstDir) {
       targetOverrides[srcKey] = dstDir;
     }
@@ -1251,6 +1291,47 @@ async function runWatch(flags, dshHome, io) {
   return 0;
 }
 
+async function runDisconnect(dshHome, io) {
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+    pollIntervalMs: 0,
+  });
+  await controller.reloadConfig();
+  await controller.disconnectVault();
+  await controller.dispose();
+  io.out('已断开防灾金库连接并暂停同步（本机全部对话与工作区文件均保持原样未删）。');
+  return 0;
+}
+
+async function runReset(dshHome, io) {
+  const controller = new SoulSyncController(null, {
+    dshHome,
+    platform: io.platform,
+    minQuietMs: io.minQuietMs ?? 0,
+    pollIntervalMs: 0,
+  });
+  await controller.reloadConfig();
+  await controller.resetLocalConfig();
+  await controller.dispose();
+  io.out('已重置本机 Soul Sync 配置与密钥（本机对话、工作区文件与登录凭据均保持原样未删）。');
+  return 0;
+}
+
+async function runUninstall(dshHome, io) {
+  const res = await uninstallPluginFromDshHome(dshHome);
+  io.out('dsh-soul-sync 插件已安全卸载完成！');
+  io.out(`- 已清理 Profile 注册: ${res.removedProfiles.length > 0 ? res.removedProfiles.join(', ') : '(无)'}`);
+  io.out(`- 已移除符号链接: ${res.removedLinks.length} 个（未触碰插件源仓库目录）`);
+  io.out(`- 已移除接力技能: ${res.removedSkill ? '是' : '未安装'}`);
+  io.out(`- 已剥离 AGENTS.md 跨机规则块: ${res.updatedAgentsMd ? '是（保留其他个人规则）' : '无需变更'}`);
+  io.out(`- 已清理 soul-sync 配置目录: ${res.removedSoulSyncDir ? '是' : '未创建'}`);
+  io.out('- 100% 完整保留：本机全部历史对话、工作区文件、登录凭据与网盘金库数据。');
+  io.out('提示：请退出并重新打开一次 DeepSeek Harness 以完成界面移除。');
+  return 0;
+}
+
 const VALID_PLATFORMS = new Set(['win32', 'darwin', 'linux']);
 
 export async function runCli(argv = [], ioOverrides = {}) {
@@ -1310,6 +1391,12 @@ export async function runCli(argv = [], ioOverrides = {}) {
         return await runDoctor(dshHome, io);
       case 'watch':
         return await runWatch(flags, dshHome, io);
+      case 'disconnect':
+        return await runDisconnect(dshHome, io);
+      case 'reset':
+        return await runReset(dshHome, io);
+      case 'uninstall':
+        return await runUninstall(dshHome, io);
       default:
         io.err(`未知子命令：${subcommand}\n\n${formatHelpText()}`);
         return 1;

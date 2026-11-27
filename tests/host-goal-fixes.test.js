@@ -14,6 +14,11 @@ import {
   loadPassphraseKey,
   writeFileAtomic,
   deriveWorkspaceId,
+  stripOuterQuotes,
+  validateWorkspaceDirectory,
+  validateVaultDirectory,
+  looksLikeCloudDrivePath,
+  ensureGlobalAgentsRules,
 } from '../lib/config.js';
 import { VaultStore } from '../lib/crypto-vault.js';
 import { encodeSegment, projectKey, encodeV4SessionLog, decodeV4SessionLog } from '../lib/zstd-v4.js';
@@ -24,6 +29,8 @@ import {
   scanLocalSessions,
   listLocalCatalog,
   listVaultCatalog,
+  isInstallWizardSession,
+  shouldAutoSyncSession,
 } from '../lib/session-plane.js';
 import { loadWorkspaceDeliverableState } from '../lib/deliverable-plane.js';
 import { SoulSyncController, apply as applySoulSync } from '../lib/index.js';
@@ -1839,5 +1846,584 @@ test('Mapping re-bind regression: changing D:\\文章 mapping from /Documents to
   } finally {
     await winCtrl.dispose();
     await macCtrl.dispose();
+  }
+});
+
+// ============================================================================
+// FOOLPROOF UX & SECURITY UPGRADE REGRESSION TESTS (#92 / #93)
+// ============================================================================
+
+test('Foolproof P0-1 + P0-2: local passphrase reveal API (no leak in GET /state, legacy compat) & same-vault clearPassphrase guard + downgrade closure', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'ux-p0-1-2');
+  const dshHome = path.join(caseDir, 'home');
+  const legacyHome = path.join(caseDir, 'legacy-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const wsDir = path.join(caseDir, 'projects', 'alpha');
+  await fs.mkdir(vaultDir, { recursive: true });
+  await fs.mkdir(wsDir, { recursive: true });
+
+  // 1. Sealed passphrase roundtrip + legacy secret.key backward compatibility
+  const secretPass = 'MySuperSecret#2026!';
+  const savedKey = await savePassphraseKey(dshHome, secretPass);
+  assert.equal(savedKey.passphrase, secretPass);
+  assert.equal(savedKey.hasRevealablePassphrase, true);
+
+  const keyRawText = await fs.readFile(path.join(dshHome, 'soul-sync', 'secret.key'), 'utf8');
+  assert.equal(keyRawText.includes(secretPass), false, 'secret.key must store AES-GCM sealed passphraseCipherHex, not raw plaintext');
+  const loadedKey = await loadPassphraseKey(dshHome);
+  assert.equal(loadedKey.passphrase, secretPass);
+  assert.equal(loadedKey.hasRevealablePassphrase, true);
+
+  // Legacy secret.key without passphraseCipherHex
+  await writeFileAtomic(
+    path.join(legacyHome, 'soul-sync', 'secret.key'),
+    JSON.stringify({ saltHex: loadedKey.saltHex, encKeyHex: loadedKey.encKeyHex, hmacKeyHex: loadedKey.hmacKeyHex }),
+    { mode: 0o600 },
+  );
+  const loadedLegacy = await loadPassphraseKey(legacyHome);
+  assert.equal(loadedLegacy.passphrase, null);
+  assert.equal(loadedLegacy.hasRevealablePassphrase, false);
+
+  // 2. GET /state NEVER leaks passphrase; POST /passphrase/reveal requires auth & returns no-store
+  await saveConfig(dshHome, {
+    deviceId: 'win-reveal',
+    deviceLabel: 'WinReveal',
+    platform: 'win32',
+    vaultDir,
+    encryptionEnabled: true,
+  });
+  await writeLocalSession(
+    dshHome,
+    { type: 'session', version: 4, id: 'sess-enc-1', createdAt: Date.now() - 2000, cwd: wsDir, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: Date.now() - 1000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '加密会话正文' }] } }],
+  );
+
+  const authCtx = {
+    connection: {
+      requestRejection(req) {
+        return String(req.headers?.cookie ?? '').includes('dsh_auth=ok') ? undefined : 401;
+      },
+    },
+  };
+  const ctrl = new SoulSyncController(authCtx, { dshHome, platform: 'win32', pollIntervalMs: 0 });
+  await ctrl.reloadConfig();
+  try {
+    await ctrl.pushAll();
+
+    // GET /state must NOT contain the plaintext passphrase anywhere in the JSON body!
+    const stateRes = await callApi(ctrl, {
+      method: 'GET',
+      url: '/__soul-sync/api/state',
+      headers: { host: '127.0.0.1:3080', cookie: 'dsh_auth=ok', 'x-dsh-soul-sync': '1' },
+    });
+    assert.equal(stateRes.status, 200);
+    assert.equal(stateRes.text.includes(secretPass), false, 'GET /state MUST NEVER leak plaintext passphrase');
+    assert.equal(stateRes.json.hasRevealablePassphrase, true);
+    assert.equal(stateRes.json.vaultLooksLikeCloudDrive, false);
+
+    // Unauthenticated POST /passphrase/reveal -> 401
+    const unauthReveal = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/passphrase/reveal',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(unauthReveal.status, 401);
+
+    // Authenticated POST /passphrase/reveal -> 200 + cache-control: no-store + exact passphrase
+    const okReveal = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/passphrase/reveal',
+      headers: { host: '127.0.0.1:3080', cookie: 'dsh_auth=ok', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(okReveal.status, 200);
+    assert.equal(okReveal.headers['cache-control'], 'no-store');
+    assert.equal(okReveal.json.available, true);
+    assert.equal(okReveal.json.passphrase, secretPass);
+
+    // 3. P0-1: Same-vault clearPassphrase: true MUST be blocked when vault has encrypted commits!
+    const blockClear = await ctrl.updateSettings({ clearPassphrase: true });
+    assert.equal(blockClear.keyUpdateBlocked, true, 'Same-vault clearPassphrase must be blocked when encrypted commits exist');
+    assert.equal(blockClear.requiresKeyRotationConfirm, true);
+    assert.equal(blockClear.confirmKind, 'clear-to-plaintext');
+    assert.equal((await loadConfig(dshHome)).encryptionEnabled, true, 'encryptionEnabled must stay true when blocked');
+    assert.ok(await loadPassphraseKey(dshHome), 'secret.key must NOT be deleted when blocked');
+
+    // 4. Explicit confirmKeyRotation: true clears key, purges old encrypted own commits, and re-pushes plaintext cleanly!
+    const confirmedClear = await ctrl.updateSettings({ clearPassphrase: true, confirmKeyRotation: true });
+    assert.equal(confirmedClear.keyUpdateBlocked, false);
+    assert.equal((await loadConfig(dshHome)).encryptionEnabled, false);
+    assert.equal(await loadPassphraseKey(dshHome), null);
+    assert.equal(ctrl.vault.encrypted, false);
+    const plainStats = await ctrl.vault.countReadableDeviceStats();
+    assert.equal(plainStats.totalFailedCount, 0, 'After confirmed plaintext downgrade, 0 undecryptable encrypted own commits should remain');
+    assert.ok(plainStats.ownDecryptedCount >= 1, 'Plaintext re-push must produce readable plaintext commits');
+  } finally {
+    await ctrl.dispose();
+  }
+});
+
+test('Foolproof P0-4 + P1-1: stripOuterQuotes, validateWorkspaceDirectory & validateVaultDirectory guards + cloud heuristic', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'ux-path-validators');
+  const dshHome = path.join(caseDir, 'dsh-home');
+  const vaultDir = path.join(caseDir, 'OneDrive', 'dsh-vault');
+  const wsDir = path.join(caseDir, 'projects', '美股分析');
+  await fs.mkdir(vaultDir, { recursive: true });
+  await fs.mkdir(wsDir, { recursive: true });
+
+  assert.equal(stripOuterQuotes('  "D:\\OneDrive\\dsh-vault"  '), 'D:\\OneDrive\\dsh-vault');
+  assert.equal(stripOuterQuotes("'/Users/mingkun/文章'"), '/Users/mingkun/文章');
+
+  // Blocked high-risk workspace directories
+  const blockedWin = [
+    'C:\\',
+    'D:\\',
+    'C:\\Windows',
+    'C:\\Program Files',
+    'C:\\Users',
+    'C:\\Users\\gongs',
+    'C:\\Users\\gongs\\.dsh',
+    'C:\\Users\\gongs\\.dsh\\sessions',
+    'C:\\Users\\gongs\\Desktop',
+    'C:\\Users\\gongs\\Documents',
+    'C:\\Users\\gongs\\Downloads',
+    'C:\\Users\\gongs\\Documents\\deepseek-harness',
+    'C:\\Users\\gongs\\Documents\\deepseek-harness\\default-workspace',
+    'C:\\Users\\gongs\\OneDrive',
+    'D:\\Second Brain\\我的坚果云',
+    vaultDir,
+    path.join(vaultDir, 'blobs'),
+    path.dirname(vaultDir),
+  ];
+  for (const p of blockedWin) {
+    const res = validateWorkspaceDirectory(p, 'win32', { dshHome, vaultDir });
+    assert.equal(res.ok, false, `Expected win32 workspace to be blocked: ${p}`);
+  }
+
+  const blockedMac = [
+    '/',
+    '/Users',
+    '/home',
+    '/Volumes',
+    '/System',
+    '/Library',
+    '/Applications',
+    '/Users/mingkun',
+    '/home/alice',
+    '/Users/mingkun/.dsh',
+    '/Users/mingkun/Desktop',
+    '/Users/mingkun/Documents',
+    '/Users/mingkun/Downloads',
+    '/Users/mingkun/Documents/deepseek-harness',
+    '/Users/mingkun/Documents/deepseek-harness/default-workspace',
+    '/Users/mingkun/Nutstore Files',
+    '/Users/mingkun/Library/Mobile Documents/com~apple~CloudDocs',
+  ];
+  for (const p of blockedMac) {
+    const res = validateWorkspaceDirectory(p, 'darwin');
+    assert.equal(res.ok, false, `Expected darwin workspace to be blocked: ${p}`);
+  }
+
+  // Allowed specific project subfolders (MUST PASS!)
+  const allowedWin = [
+    'D:\\文章',
+    '"D:\\文章"',
+    'C:\\Users\\gongs\\Desktop\\01v3-核心框架库',
+    'C:\\Users\\gongs\\Documents\\美股分析',
+    wsDir,
+  ];
+  for (const p of allowedWin) {
+    const res = validateWorkspaceDirectory(p, 'win32', { dshHome, vaultDir });
+    assert.equal(res.ok, true, `Expected win32 workspace to pass: ${p}, got error=${res.error}`);
+  }
+
+  const allowedMac = [
+    '/Users/mingkun/文章',
+    '/Users/mingkun/Documents/文章',
+    '/Users/mingkun/Desktop/我的项目',
+    '/tmp/test-project',
+  ];
+  for (const p of allowedMac) {
+    const res = validateWorkspaceDirectory(p, 'darwin');
+    assert.equal(res.ok, true, `Expected darwin workspace to pass: ${p}, got error=${res.error}`);
+  }
+
+  // validateVaultDirectory: quote stripping, cross-OS rejection, mapping overlap rejection, cloud heuristic
+  assert.equal(validateVaultDirectory('"/Users/me/dsh-vault"', 'win32').ok, false, 'Win must reject POSIX /Users/... vault path');
+  assert.equal(validateVaultDirectory('"D:\\OneDrive\\dsh-vault"', 'darwin').ok, false, 'Mac must reject Win D:\\... vault path');
+  assert.equal(validateVaultDirectory('D:\\', 'win32').ok, false);
+  assert.equal(validateVaultDirectory('C:\\Users\\gongs\\Desktop', 'win32').ok, false);
+  assert.equal(validateVaultDirectory('C:\\Users\\gongs\\.dsh\\vault', 'win32').ok, false);
+  assert.equal(
+    validateVaultDirectory(wsDir, 'win32', { workspaceMappings: [{ id: 'm1', title: '美股分析', win32: wsDir }] }).ok,
+    false,
+    'Vault dir overlapping mapped workspace must be rejected',
+  );
+
+  const okQuotedVault = validateVaultDirectory(`"${vaultDir}"`, 'win32', { dshHome });
+  assert.equal(okQuotedVault.ok, true);
+  assert.equal(okQuotedVault.normalizedPath, vaultDir);
+  assert.equal(okQuotedVault.looksLikeCloudDrive, true);
+
+  // P2-1: `.` / `..` traversal normalization + bare cloud drive root rejection in validateVaultDirectory
+  assert.equal(validateVaultDirectory('D:\\OneDrive\\..', 'win32').ok, false, 'P2-1: D:\\OneDrive\\.. normalizes to D:\\ and must be blocked');
+  assert.equal(validateWorkspaceDirectory('C:\\Users\\gongs\\Desktop\\.', 'win32').ok, false, 'P2-1: Desktop\\. must be blocked');
+  assert.equal(validateWorkspaceDirectory('C:\\Users\\gongs\\Desktop\\sub\\..', 'win32').ok, false, 'P2-1: Desktop\\sub\\.. must be blocked');
+  assert.equal(validateWorkspaceDirectory('/Users/mingkun/Documents/foo/..', 'darwin').ok, false, 'P2-1: Documents/foo/.. must be blocked');
+  assert.equal(validateVaultDirectory('C:\\Users\\gongs\\OneDrive', 'win32').ok, false, 'P2-1: bare OneDrive root must be blocked as vaultDir');
+  assert.equal(validateVaultDirectory('D:\\Second Brain\\我的坚果云', 'win32').ok, false, 'P2-1: bare Nutstore root must be blocked as vaultDir');
+  assert.equal(validateVaultDirectory('/Users/mingkun/Nutstore Files', 'darwin').ok, false, 'P2-1: bare Mac Nutstore Files root must be blocked as vaultDir');
+  assert.equal(validateVaultDirectory('/Users/mingkun/Library/Mobile Documents/com~apple~CloudDocs', 'darwin').ok, false, 'P2-1: bare iCloud CloudDocs root must be blocked as vaultDir');
+  assert.equal(validateVaultDirectory('D:\\Second Brain\\我的坚果云\\DSH', 'win32').ok, true, 'P2-1: dedicated subfolder inside Nutstore MUST be allowed as vaultDir');
+  assert.equal(validateVaultDirectory('/Users/mingkun/Library/CloudStorage/OneDrive-Personal/dsh-vault', 'darwin').ok, true, 'P2-1: dedicated subfolder inside Mac OneDrive MUST be allowed as vaultDir');
+
+  assert.equal(looksLikeCloudDrivePath('D:\\OneDrive\\dsh-vault'), true);
+  assert.equal(looksLikeCloudDrivePath('/Users/me/Library/CloudStorage/OneDrive-Personal/dsh-vault'), true);
+  assert.equal(looksLikeCloudDrivePath('D:\\我的坚果云\\DSH'), true);
+  assert.equal(looksLikeCloudDrivePath('\\\\MyNAS\\share\\dsh-vault'), true);
+  assert.equal(looksLikeCloudDrivePath('D:\\local-only\\my-folder'), false);
+});
+
+test('Foolproof P0-3: syncVolatileSettings does NOT clobber panel updates on restart & routes passphrase through guard', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'ux-p0-3-volatile');
+  const dshHome = path.join(caseDir, 'home');
+  const vaultA = path.join(caseDir, 'vault-a');
+  const vaultB = path.join(caseDir, 'vault-b');
+  const wsDir = path.join(caseDir, 'ws');
+  await fs.mkdir(vaultA, { recursive: true });
+  await fs.mkdir(vaultB, { recursive: true });
+  await fs.mkdir(wsDir, { recursive: true });
+
+  const makeVolatile = (initial) => {
+    let v = initial;
+    return { get: () => v, set: (n) => { v = n; } };
+  };
+
+  // Step 1: User initially configures via native volatile Settings UI -> vaultA + passA
+  const vVault = makeVolatile(vaultA);
+  const vPass = makeVolatile('pass-A');
+  const vLabel = makeVolatile('NativeWin');
+  const ctrl1 = new SoulSyncController(null, {
+    dshHome,
+    platform: 'win32',
+    pollIntervalMs: 0,
+    vaultDir: vVault,
+    passphrase: vPass,
+    deviceLabel: vLabel,
+  });
+  await ctrl1.start();
+  assert.equal(path.resolve(ctrl1.config.vaultDir), path.resolve(vaultA));
+  assert.equal((await loadPassphraseKey(dshHome)).passphrase, 'pass-A');
+
+  // Step 2: User switches to vaultB + passB + PanelWin inside the migration panel (`updateSettings`)
+  await writeLocalSession(
+    dshHome,
+    { type: 'session', version: 4, id: 'sess-vol-1', createdAt: Date.now() - 1000, cwd: wsDir, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: Date.now() - 500, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '面板更新后会话' }] } }],
+  );
+  await ctrl1.updateSettings({ vaultDir: vaultB, passphrase: 'pass-B', deviceLabel: 'PanelWin' });
+  await ctrl1.pushAll();
+  await ctrl1.dispose();
+
+  // Step 3: Restart DSH with stale cordis.patch.yml still holding vaultA + pass-A + NativeWin -> MUST NOT roll back!
+  const ctrl2 = new SoulSyncController(null, {
+    dshHome,
+    platform: 'win32',
+    pollIntervalMs: 0,
+    vaultDir: makeVolatile(vaultA),
+    passphrase: makeVolatile('pass-A'),
+    deviceLabel: makeVolatile('NativeWin'),
+  });
+  await ctrl2.start();
+  try {
+    assert.equal(path.resolve(ctrl2.config.vaultDir), path.resolve(vaultB), 'P0-3: restart must NOT roll back vaultDir to stale volatile config');
+    assert.equal(ctrl2.config.deviceLabel, 'PanelWin', 'P0-3: restart must NOT roll back deviceLabel');
+    assert.equal((await loadPassphraseKey(dshHome)).passphrase, 'pass-B', 'P0-3: restart must NOT roll back passphrase');
+
+    // Step 4: User types a WRONG new passphrase in native volatile settings -> MUST be blocked by guard (not overwrite secret.key)!
+    ctrl2.pluginConfig.passphrase.set('wrong-native-typo');
+    const badVolRes = await ctrl2.syncVolatileSettings({ triggerPull: false });
+    assert.equal(badVolRes.blocked, true, 'P0-3: volatile passphrase change must go through updateSettings guard');
+    assert.equal((await loadPassphraseKey(dshHome)).passphrase, 'pass-B', 'P0-3: blocked volatile typo must NOT overwrite secret.key');
+
+    // Step 5 (P1-1): Offline edit to ONLY `deviceLabel` in cordis.patch.yml -> restart applies ONLY deviceLabel,
+    //                NEVER rolls back vaultB or pass-B to stale vaultA / pass-A!
+    await ctrl2.dispose();
+    const ctrl3 = new SoulSyncController(null, {
+      dshHome,
+      platform: 'win32',
+      pollIntervalMs: 0,
+      vaultDir: makeVolatile(vaultA),
+      passphrase: makeVolatile('wrong-native-typo'),
+      deviceLabel: makeVolatile('EditedOfflineLabel'),
+    });
+    await ctrl3.start();
+    assert.equal(ctrl3.config.deviceLabel, 'EditedOfflineLabel', 'P1-1: genuinely changed single native field must apply on restart');
+    assert.equal(path.resolve(ctrl3.config.vaultDir), path.resolve(vaultB), 'P1-1: unchanged native vaultA must NOT roll back vaultB');
+    assert.equal((await loadPassphraseKey(dshHome)).passphrase, 'pass-B', 'P1-1: unchanged native passphrase must NOT roll back pass-B');
+
+    // Step 6 (P1-1): Disconnect vault -> restart with stale native vaultA/passphrase MUST stay disconnected!
+    await ctrl3.disconnectVault();
+    await ctrl3.dispose();
+    const ctrl4 = new SoulSyncController(null, {
+      dshHome,
+      platform: 'win32',
+      pollIntervalMs: 0,
+      vaultDir: makeVolatile(vaultA),
+      passphrase: makeVolatile('wrong-native-typo'),
+      deviceLabel: makeVolatile('EditedOfflineLabel'),
+    });
+    await ctrl4.start();
+    assert.equal(ctrl4.config.vaultDir, '', 'P1-1: restart after disconnectVault must NEVER resurrect stale native vaultDir');
+
+    // Step 7 (P1-1): Reset local config -> restart with stale native vaultA/passphrase MUST stay reset (no vault, no key)!
+    await ctrl4.resetLocalConfig();
+    await ctrl4.dispose();
+    const ctrl5 = new SoulSyncController(null, {
+      dshHome,
+      platform: 'win32',
+      pollIntervalMs: 0,
+      vaultDir: makeVolatile(vaultA),
+      passphrase: makeVolatile('wrong-native-typo'),
+      deviceLabel: makeVolatile('EditedOfflineLabel'),
+    });
+    await ctrl5.start();
+    assert.equal(ctrl5.config.vaultDir, '', 'P1-1: restart after resetLocalConfig must NEVER resurrect stale native vaultDir');
+    assert.equal(await loadPassphraseKey(dshHome), null, 'P1-1: restart after resetLocalConfig must NEVER resurrect stale native secret.key');
+    await ctrl5.dispose();
+  } finally {
+    await ctrl2.dispose();
+  }
+});
+
+test('Foolproof P1-2 + P1-5: install wizard sessions skipped from auto-sync & localCatalog marks isInstallSession + inVault', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'ux-p1-2-install-filter');
+  const dshHome = path.join(caseDir, 'home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const wsDir = path.join(caseDir, 'projects', 'work');
+  await fs.mkdir(vaultDir, { recursive: true });
+  await fs.mkdir(wsDir, { recursive: true });
+
+  const now = Date.now();
+  const installEvents = [
+    { seq: 0, time: now - 3000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '请你帮我安装并配置 DeepSeek Harness 跨电脑防灾同步插件（dsh-soul-sync），运行 install-win.ps1' }] } },
+    { seq: 1, time: now - 2500, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '金库路径 D:\\OneDrive\\dsh-vault，口令 my-pass' }] } },
+  ];
+  const normalEvents = [
+    { seq: 0, time: now - 1000, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我分析一下台积电毛利率变化' }] } },
+  ];
+  const devEditPsEvents = [
+    { seq: 0, time: now - 900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我修改 dsh-soul-sync 里的 scripts/install-win.ps1，修复 PowerShell 5.1 参数转义问题' }] } },
+  ];
+  const devPolishPromptEvents = [
+    { seq: 0, time: now - 800, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我润色一下 dsh-soul-sync 里的 INSTALL_PROMPT.md 文案' }] } },
+  ];
+  const devCheckMacEvents = [
+    { seq: 0, time: now - 700, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我检查 dsh-soul-sync 的 scripts/install-mac.sh 有没有 bash 兼容性问题' }] } },
+  ];
+
+  assert.equal(isInstallWizardSession(installEvents), true);
+  assert.equal(isInstallWizardSession(normalEvents), false);
+  assert.equal(isInstallWizardSession(devEditPsEvents), false, 'P2-2: dev session editing install-win.ps1 must NOT be misclassified');
+  assert.equal(isInstallWizardSession(devPolishPromptEvents), false, 'P2-2: dev session polishing INSTALL_PROMPT.md must NOT be misclassified');
+  assert.equal(isInstallWizardSession(devCheckMacEvents), false, 'P2-2: dev session reviewing install-mac.sh must NOT be misclassified');
+  assert.deepEqual(shouldAutoSyncSession({ sessionId: 'sess-inst', header: { cwd: wsDir }, events: installEvents }, { syncScope: 'active' }, 'win32'), {
+    allowed: false,
+    reason: 'install-wizard',
+  });
+
+  await saveConfig(dshHome, { deviceId: 'win-inst', deviceLabel: 'WinInst', platform: 'win32', vaultDir });
+  await writeLocalSession(dshHome, { type: 'session', version: 4, id: 'sess-inst', createdAt: now - 3000, cwd: wsDir, isSeeded: false, delegationDepth: 0 }, installEvents);
+  await writeLocalSession(dshHome, { type: 'session', version: 4, id: 'sess-biz', createdAt: now - 1000, cwd: wsDir, isSeeded: false, delegationDepth: 0 }, normalEvents);
+
+  const ctrl = new SoulSyncController(null, { dshHome, platform: 'win32', pollIntervalMs: 0 });
+  await ctrl.reloadConfig();
+  try {
+    const pushRes = await ctrl.pushAll();
+    assert.equal(pushRes.sessionPushedCount, 1, 'Auto pushAll must skip install wizard session and push only real business session');
+
+    const stateRes = await callApi(ctrl, {
+      method: 'GET',
+      url: '/__soul-sync/api/state',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+    });
+    assert.equal(stateRes.status, 200);
+    const sessions = stateRes.json.localCatalog.workspaces.flatMap((w) => w.sessions);
+    const instEntry = sessions.find((s) => s.sessionId === 'sess-inst');
+    const bizEntry = sessions.find((s) => s.sessionId === 'sess-biz');
+    assert.equal(instEntry?.isInstallSession, true);
+    assert.equal(instEntry?.inVault, false, 'Unpushed install session must have inVault: false');
+    assert.equal(bizEntry?.isInstallSession, false);
+    assert.equal(bizEntry?.inVault, true, 'Pushed business session must have inVault: true');
+  } finally {
+    await ctrl.dispose();
+  }
+});
+
+test('Foolproof P1-4: POST /disconnect, POST /reset, POST /uninstall & CLI dsh-soul uninstall preserve source repo, sessions & credentials 100%', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'ux-p1-4-maint-uninstall');
+  const dshHome = path.join(caseDir, 'sandbox-dsh');
+  const vaultDir = path.join(caseDir, 'vault');
+  const fakePluginSource = path.join(caseDir, 'fake-plugin-source-repo');
+  const wsDir = path.join(caseDir, 'my-work');
+  await fs.mkdir(vaultDir, { recursive: true });
+  await fs.mkdir(fakePluginSource, { recursive: true });
+  await fs.mkdir(wsDir, { recursive: true });
+
+  // Plant precious files inside fake plugin source repo (to prove uninstall NEVER deletes source repo!)
+  await fs.writeFile(path.join(fakePluginSource, 'package.json'), JSON.stringify({ name: 'dsh-soul-sync', version: '0.1.0' }), 'utf8');
+  await fs.writeFile(path.join(fakePluginSource, 'KEEP_ME.txt'), 'plugin-source-must-survive', 'utf8');
+
+  // Plant precious user files in sandbox dshHome (sessions, storages, attachments, .credentials.yaml, custom AGENTS.md)
+  await fs.mkdir(path.join(dshHome, 'storages'), { recursive: true });
+  await fs.mkdir(path.join(dshHome, 'attachments'), { recursive: true });
+  await fs.writeFile(path.join(dshHome, '.credentials.yaml'), 'token: keep-my-login-safe\n', 'utf8');
+  await fs.writeFile(path.join(dshHome, 'storages', 'workspace.json'), JSON.stringify({ keep: true }), 'utf8');
+  await fs.writeFile(path.join(dshHome, 'attachments', 'chart.png'), 'png-bytes', 'utf8');
+  await fs.writeFile(path.join(dshHome, 'AGENTS.md'), '# My Custom Personal Rule\nKeep this intact.\n', 'utf8');
+  await ensureGlobalAgentsRules(dshHome);
+  await fs.mkdir(path.join(dshHome, 'skills', 'soul-handoff'), { recursive: true });
+  await fs.writeFile(path.join(dshHome, 'skills', 'soul-handoff', 'SKILL.md'), '---\nname: soul-handoff\n---\n', 'utf8');
+
+  // Seed desktop & web profiles + symlink/junction to fakePluginSource
+  for (const prof of ['desktop', 'web']) {
+    const profDir = path.join(dshHome, 'profiles', prof);
+    await fs.mkdir(path.join(profDir, 'node_modules'), { recursive: true });
+    await fs.writeFile(
+      path.join(profDir, 'package.json'),
+      JSON.stringify({
+        name: `dsh-${prof}`,
+        dependencies: { 'other-pkg': '1.0.0', 'dsh-soul-sync': `link:${fakePluginSource}` },
+        dsh: { profile: { bundles: ['other-pkg', 'dsh-soul-sync'] } },
+      }, null, 2),
+      'utf8',
+    );
+    await fs.symlink(
+      fakePluginSource,
+      path.join(profDir, 'node_modules', 'dsh-soul-sync'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+  }
+
+  const sessLogPath = await writeLocalSession(
+    dshHome,
+    { type: 'session', version: 4, id: 'sess-keep-me', createdAt: Date.now() - 1000, cwd: wsDir, isSeeded: false, delegationDepth: 0 },
+    [{ seq: 0, time: Date.now() - 500, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '重要历史对话' }] } }],
+  );
+
+  await savePassphraseKey(dshHome, 'maint-secret');
+  await saveConfig(dshHome, { deviceId: 'win-maint', deviceLabel: 'WinMaint', platform: 'win32', vaultDir, encryptionEnabled: true });
+
+  const ctrl = new SoulSyncController(null, { dshHome, platform: 'win32', pollIntervalMs: 0 });
+  await ctrl.reloadConfig();
+  try {
+    // 1. POST /disconnect clears vaultDir & stops vault while preserving sessions
+    const discRes = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/disconnect',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(discRes.status, 200);
+    assert.equal(ctrl.vault, null);
+    assert.equal((await loadConfig(dshHome)).vaultDir, '');
+
+    // 2. POST /reset requires confirm: true
+    const badReset = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/reset',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(badReset.status, 400);
+
+    const okReset = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/reset',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: { confirm: true },
+    });
+    assert.equal(okReset.status, 200);
+    assert.equal(await loadPassphraseKey(dshHome), null);
+    assert.equal((await loadConfig(dshHome)).vaultDir, '');
+
+    // 3. POST /uninstall requires confirm: true, removes profiles/links/skill/AGENTS block/soul-sync,
+    //    AND strictly preserves fakePluginSource, sessions, storages, attachments & .credentials.yaml!
+    const badUninst = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/uninstall',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(badUninst.status, 400);
+
+    const okUninst = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/uninstall',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: { confirm: true },
+    });
+    assert.equal(okUninst.status, 200);
+    assert.deepEqual(okUninst.json.removedProfiles.sort(), ['desktop', 'web']);
+    assert.equal(okUninst.json.removedLinks.length, 2);
+    assert.equal(okUninst.json.removedSkill, true);
+    assert.equal(okUninst.json.updatedAgentsMd, true);
+    assert.equal(okUninst.json.removedSoulSyncDir, true);
+
+    for (const prof of ['desktop', 'web']) {
+      const pkg = JSON.parse(await fs.readFile(path.join(dshHome, 'profiles', prof, 'package.json'), 'utf8'));
+      assert.equal(pkg.dependencies['dsh-soul-sync'], undefined);
+      assert.equal(pkg.dependencies['other-pkg'], '1.0.0');
+      assert.deepEqual(pkg.dsh.profile.bundles, ['other-pkg']);
+      await assert.rejects(() => fs.lstat(path.join(dshHome, 'profiles', prof, 'node_modules', 'dsh-soul-sync')));
+    }
+    await assert.rejects(() => fs.stat(path.join(dshHome, 'skills', 'soul-handoff')));
+    await assert.rejects(() => fs.stat(path.join(dshHome, 'soul-sync')));
+
+    const agentsAfter = await fs.readFile(path.join(dshHome, 'AGENTS.md'), 'utf8');
+    assert.match(agentsAfter, /My Custom Personal Rule/);
+    assert.equal(agentsAfter.includes('dsh-soul-sync:cross-os-rules'), false);
+
+    // CRITICAL SAFETY ASSERTIONS: source repo, sessions, storages, attachments, credentials 100% intact!
+    assert.equal(await fs.readFile(path.join(fakePluginSource, 'KEEP_ME.txt'), 'utf8'), 'plugin-source-must-survive');
+    assert.equal(await fs.readFile(path.join(dshHome, '.credentials.yaml'), 'utf8'), 'token: keep-my-login-safe\n');
+    assert.equal(await fs.readFile(path.join(dshHome, 'storages', 'workspace.json'), 'utf8'), JSON.stringify({ keep: true }));
+    assert.equal(await fs.readFile(path.join(dshHome, 'attachments', 'chart.png'), 'utf8'), 'png-bytes');
+    assert.ok(await fs.stat(sessLogPath), 'Local session file must remain 100% untouched');
+
+    // P2-3: After uninstallPlugin(), controller is disposed/uninstalled: write API calls MUST reject
+    // and GET /state MUST return uninstalled: true WITHOUT recreating `<dshHome>/soul-sync/`!
+    assert.equal(ctrl._disposed, true);
+    assert.equal(ctrl._uninstalled, true);
+    const postUninstWrite = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/settings',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: { folderMatchMode: 'mapped-only' },
+    });
+    assert.equal(postUninstWrite.status, 400);
+    assert.match(postUninstWrite.json?.error || '', /已卸载/);
+    const postUninstState = await callApi(ctrl, {
+      method: 'GET',
+      url: '/__soul-sync/api/state',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+    });
+    assert.equal(postUninstState.status, 200);
+    assert.equal(postUninstState.json?.uninstalled, true);
+    await assert.rejects(() => fs.stat(path.join(dshHome, 'soul-sync')), 'P2-3: soul-sync dir must NOT be recreated after uninstall');
+
+    // 4. CLI `dsh-soul uninstall` is idempotent and exits 0 cleanly
+    const cliOut = [];
+    const cliCode = await runCli(['--dsh-home', dshHome, 'uninstall'], {
+      stdout: (s) => cliOut.push(s),
+      stderr: (s) => cliOut.push(s),
+      isTTY: false,
+    });
+    assert.equal(cliCode, 0);
+    assert.match(cliOut.join(''), /卸载完成/);
+    assert.equal(await fs.readFile(path.join(fakePluginSource, 'KEEP_ME.txt'), 'utf8'), 'plugin-source-must-survive');
+  } finally {
+    await ctrl.dispose();
   }
 });
