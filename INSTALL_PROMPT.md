@@ -11,9 +11,10 @@
 请你帮我安装并配置 DeepSeek Harness 跨电脑防灾同步与灵魂接力插件（dsh-soul-sync）。
 我是非技术用户，不需要我敲命令行，请你全程替我执行并只用通俗易懂的中文和我沟通。请严格按以下 4 步推进：
 
-### 第 1 步：定位本机 `dsh-soul-sync` 文件夹
-- 先检查当前工作区或其常见相邻目录里是否包含 `scripts/install-win.ps1`、`scripts/install-mac.sh` 与 `bin/dsh-soul.js`。
-- 如果找到了，直接使用该路径作为 `<repo>`（若位于临时「下载」目录，顺便提醒用户安装后不要删除或移动该文件夹，因为 DSH 通过 `link:` 直接挂载它；如果日后不小心移动了文件夹位置，只需重新跑一遍本安装步骤即可修复）；如果当前目录不是它，请先礼貌地问我「你把 dsh-soul-sync 文件夹放在电脑哪个位置了？（可以直接把文件夹拖进对话框）」。
+### 第 1 步：准备或更新本机 `dsh-soul-sync` 插件目录（无需我装 Git）
+- 先检查当前工作区或固定目录（Windows 优先看 `$HOME\Documents\dsh-soul-sync`；macOS 优先看 `~/Documents/dsh-soul-sync` 或 `~/Documents/deepseek-harness/dsh-soul-sync`）是否已有 `dsh-soul-sync`（含 `scripts/install-win.ps1`、`scripts/install-mac.sh` 与 `bin/dsh-soul.js`）。
+- 如果本机还没有：无需让我手动下载，请直接替我从公开仓库 `https://github.com/yulong1993/dsh-soul-sync` 自动拉取到我的「文档」固定目录（有 `git` 可 `git clone https://github.com/yulong1993/dsh-soul-sync.git`；没装 `git` 可直接用系统自带的 `curl -L https://codeload.github.com/yulong1993/dsh-soul-sync/tar.gz/refs/heads/main` 配合 `tar -xzf` 解压成 `dsh-soul-sync` 文件夹），并提醒我日后不要删除该文件夹。
+- 如果本机已经有了且含 `.git` 目录，请顺手先 `git pull` 更新到最新版。
 
 ### 第 2 步：用大白话一次性向我确认 2 个核心问题（不要分开追问太多轮）
 1. **网盘里的「防灾金库」文件夹路径**：问我准备用哪个网盘同步目录当金库（例如坚果云 / OneDrive / iCloud 下的空文件夹 `dsh-vault`，提醒我右键该网盘文件夹勾选「始终保留在此设备上 / Always keep on this device」）。如果目录还没建好，主动告诉我你可以顺手帮我建出来。
@@ -54,6 +55,7 @@
 
 ---
 
-## 另一台电脑怎么装？
+## 另一台电脑或同事怎么装 / 怎么升级？
 
-在另一台电脑（比如家里的 Mac）把仓库拉下来或拷贝过去，打开 DeepSeek Harness，把上面**同一段提示词**再发给 AI，填入**同一个网盘金库文件夹**和**同一个加密口令**即可！
+- **首次安装（连压缩包都不用拷）**：在另一台电脑打开 DeepSeek Harness，直接把上面**同一段提示词**发给 AI，AI 会自动从公开仓库下载好插件，你只需填入**同一个网盘金库文件夹**和**同一个加密口令**即可！
+- **日后升级**：直接打开左下角 **⚙️「设置 → Soul Sync 跨机迁移」**，点击右上角 **「⬆️ 检查更新」 → 「立即一键更新」**（不管电脑装没装 Git 都能秒更），重开一次软件即生效！

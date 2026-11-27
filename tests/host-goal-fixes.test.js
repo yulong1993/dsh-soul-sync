@@ -2427,3 +2427,102 @@ test('Foolproof P1-4: POST /disconnect, POST /reset, POST /uninstall & CLI dsh-s
     await ctrl.dispose();
   }
 });
+
+test('Zero-Git Self-Updater: POST /update/check & POST /update/apply update non-Git colleague installs via tar.gz and block path traversal', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const caseDir = path.join(TEST_TMP_ROOT, 'self-updater-zero-git');
+  const dshHome = path.join(caseDir, 'home');
+  const installedRepo = path.join(caseDir, 'colleague-plugin');
+  const remoteBuildDir = path.join(caseDir, 'remote-build');
+  const remotePkgRoot = path.join(remoteBuildDir, 'dsh-soul-sync-aaaaaaaa');
+  const tarballPath = path.join(caseDir, 'mock-release.tar.gz');
+
+  await fs.mkdir(path.join(installedRepo, 'lib'), { recursive: true });
+  await fs.writeFile(path.join(installedRepo, 'package.json'), JSON.stringify({ name: 'dsh-soul-sync', version: '0.1.0' }), 'utf8');
+  await fs.writeFile(path.join(installedRepo, 'lib', 'index.js'), '// old index\n', 'utf8');
+  await fs.writeFile(path.join(installedRepo, 'lib', 'client.js'), '// old client\n', 'utf8');
+
+  await fs.mkdir(path.join(remotePkgRoot, 'lib'), { recursive: true });
+  await fs.mkdir(path.join(remotePkgRoot, 'bin'), { recursive: true });
+  await fs.writeFile(path.join(remotePkgRoot, 'package.json'), JSON.stringify({ name: 'dsh-soul-sync', version: '0.2.0' }), 'utf8');
+  await fs.writeFile(path.join(remotePkgRoot, 'lib', 'index.js'), '// updated v0.2.0 index\n', 'utf8');
+  await fs.writeFile(path.join(remotePkgRoot, 'lib', 'client.js'), '// updated v0.2.0 client\n', 'utf8');
+  await fs.writeFile(path.join(remotePkgRoot, 'bin', 'dsh-soul.js'), '#!/usr/bin/env node\r\n// crlf normalized to lf\r\n', 'utf8');
+
+  await execFileAsync('tar', ['-czf', tarballPath, '-C', remoteBuildDir, 'dsh-soul-sync-aaaaaaaa']);
+  const tarballBytes = await fs.readFile(tarballPath);
+  const remoteSha = 'a'.repeat(40);
+
+  const mockFetch = async (url) => {
+    if (String(url).includes('api.github.com')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          sha: remoteSha,
+          commit: { message: 'feat: shiny new colleague UX\ndetails', committer: { date: '2026-11-27T09:00:00Z' } },
+        }),
+      };
+    }
+    if (String(url).includes('codeload.github.com')) {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => tarballBytes.buffer.slice(tarballBytes.byteOffset, tarballBytes.byteOffset + tarballBytes.byteLength),
+      };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  await saveConfig(dshHome, { deviceId: 'colleague-pc', deviceLabel: 'ColleaguePC', platform: 'win32' });
+  const ctrl = new SoulSyncController(null, {
+    dshHome,
+    platform: 'win32',
+    pollIntervalMs: 0,
+    repoRoot: installedRepo,
+    updateFetchImpl: mockFetch,
+  });
+  await ctrl.reloadConfig();
+
+  try {
+    const chk = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/update/check',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(chk.status, 200);
+    assert.equal(chk.json?.hasUpdate, true);
+    assert.equal(chk.json?.remoteShort, 'aaaaaaa');
+    assert.equal(chk.json?.remoteMessage, 'feat: shiny new colleague UX');
+
+    const app = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/update/apply',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(app.status, 200);
+    assert.equal(app.json?.updated, true);
+    assert.equal(app.json?.method, 'tarball');
+    assert.match(await fs.readFile(path.join(installedRepo, 'lib', 'client.js'), 'utf8'), /updated v0\.2\.0 client/);
+    const binText = await fs.readFile(path.join(installedRepo, 'bin', 'dsh-soul.js'), 'utf8');
+    assert.equal(binText.includes('\r'), false, 'Self-updater must normalize bin/dsh-soul.js line endings to pure LF');
+
+    // Subsequent check reports hasUpdate === false via .dsh-soul-version.json stamp!
+    const chk2 = await callApi(ctrl, {
+      method: 'POST',
+      url: '/__soul-sync/api/update/check',
+      headers: { host: '127.0.0.1:3080', 'x-dsh-soul-sync': '1' },
+      body: {},
+    });
+    assert.equal(chk2.status, 200);
+    assert.equal(chk2.json?.hasUpdate, false);
+    assert.equal(chk2.json?.localCommit, remoteSha);
+  } finally {
+    await ctrl.dispose();
+  }
+});

@@ -2,3 +2,4 @@ node_modules/
 .test-tmp/
 *.tgz
 .DS_Store
+.dsh-soul-version.json

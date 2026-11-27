@@ -30,6 +30,7 @@ import {
   validateWorkspaceDirectory,
   uninstallPluginFromDshHome,
 } from '../lib/config.js';
+import { applyRemoteUpdate } from '../lib/self-updater.js';
 import { scanLocalSessions } from '../lib/session-plane.js';
 import { VaultStore } from '../lib/crypto-vault.js';
 import {
@@ -1397,6 +1398,19 @@ export async function runCli(argv = [], ioOverrides = {}) {
         return await runReset(dshHome, io);
       case 'uninstall':
         return await runUninstall(dshHome, io);
+      case 'update': {
+        const upd = await applyRemoteUpdate({ repoRoot: REPO_ROOT, dshHome });
+        if (!upd.ok) {
+          io.err(`更新未执行：${upd.error}`);
+          return 1;
+        }
+        if (upd.alreadyLatest) {
+          io.out(`当前已是最新版本（#${upd.remoteShort}），无需更新。`);
+        } else {
+          io.out(`已更新至最新版本 #${upd.remoteShort}（方式: ${upd.method}）。请重启 DeepSeek Harness 生效。`);
+        }
+        return 0;
+      }
       default:
         io.err(`未知子命令：${subcommand}\n\n${formatHelpText()}`);
         return 1;
