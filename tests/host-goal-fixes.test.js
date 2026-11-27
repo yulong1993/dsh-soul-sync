@@ -1726,3 +1726,118 @@ test('UX Hardening: vaultDir cannot be bound as project workspace, listLocalCata
     await ctrl.dispose();
   }
 });
+
+test('Mapping re-bind regression: changing D:\\文章 mapping from /Documents to /Documents/文章 migrates existing peer session cleanly with ZERO false split-brain fork', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'rebind-mapping-no-false-fork');
+  const winHome = path.join(caseDir, 'win-home');
+  const macHome = path.join(caseDir, 'mac-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const winArticle = 'D:\\文章';
+  const macDocs = '/Users/mingkun/Documents';
+  const macDocsArticle = '/Users/mingkun/Documents/文章';
+  const macSiblingArticle = '/Users/mingkun/文章';
+  await fs.mkdir(vaultDir, { recursive: true });
+
+  await savePassphraseKey(winHome, 'rebind-pass');
+  await savePassphraseKey(macHome, 'rebind-pass');
+  await saveConfig(winHome, {
+    deviceId: 'xuanyuan-e31ecc01',
+    deviceLabel: 'xuanyuan',
+    platform: 'win32',
+    vaultDir,
+    encryptionEnabled: true,
+    folderMatchMode: 'mapped-only',
+    syncScope: 'selected',
+    selectedWorkspaces: [winArticle],
+    workspaceMappings: [
+      { id: '文章-0aa2', title: '文章', win32: winArticle, darwin: macDocs, updatedAt: 1000 },
+    ],
+  });
+  await saveConfig(macHome, {
+    deviceId: 'mac-studio-01',
+    deviceLabel: 'MacStudio',
+    platform: 'darwin',
+    vaultDir,
+    encryptionEnabled: true,
+    folderMatchMode: 'mapped-only',
+  });
+
+  const sid = 'session-2a04539d-ac41-435a-8c96-79b972de384d';
+  const now = Date.now();
+  await writeLocalSession(
+    winHome,
+    { type: 'session', version: 4, id: sid, createdAt: now - 10000, cwd: winArticle, isSeeded: false, delegationDepth: 0 },
+    [
+      { seq: 0, time: now - 9000, type: 'turn/start', data: { turn: 1 } },
+      { seq: 1, time: now - 8900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '生成纳指SOXX公众号文章' }] } },
+      { seq: 2, time: now - 8500, type: 'deliverables/presented', data: { turn: 1, callId: 'call_1', files: [{ path: 'D:\\文章\\公众号文章_一年只有一两把.md', description: '约稿版' }] } },
+      { seq: 3, time: now - 8000, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    ],
+  );
+
+  const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', pollIntervalMs: 0 });
+  const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', pollIntervalMs: 0 });
+  await winCtrl.reloadConfig();
+  await macCtrl.reloadConfig();
+
+  try {
+    await winCtrl.syncGlobalWorkspaceMetadata({ publishLocal: true });
+    await winCtrl.pushAll();
+
+    // 1. Mac initially pulls under D:\文章 ⇄ /Users/mingkun/Documents
+    await macCtrl.syncGlobalWorkspaceMetadata();
+    const pull1 = await macCtrl.pullAll();
+    assert.equal(pull1.sessions.summary.imported, 1);
+    assert.equal(pull1.sessions.summary.forkedBranches, 0);
+    let macSessions = await scanLocalSessions(macHome);
+    assert.equal(macSessions.get(sid)?.header?.cwd, macDocs);
+    assert.equal(
+      macSessions.get(sid)?.events?.find((e) => e.type === 'deliverables/presented')?.data?.files?.[0]?.path,
+      '/Users/mingkun/Documents/公众号文章_一年只有一两把.md',
+    );
+
+    // 2. User deletes old mapping and re-binds D:\文章 ⇄ /Users/mingkun/Documents/文章 (child folder of previous target!)
+    await winCtrl.removeMapping({ id: '文章-0aa2' });
+    const addRes = await winCtrl.handleAddMapping({ winPath: winArticle, macPath: macDocsArticle, triggerPull: false });
+    assert.equal(addRes.kind, 'success');
+
+    // Mac syncs updated mapping & pulls -> MUST migrate in-place to /Users/mingkun/Documents/文章 with ZERO false fork!
+    await macCtrl.syncGlobalWorkspaceMetadata();
+    const pull2 = await macCtrl.pullAll();
+    assert.equal(pull2.sessions.summary.forkedBranches, 0, 'Must NEVER create a false split-brain branch when mapping target changes');
+    assert.equal(pull2.sessions.summary.migrated, 1, 'Existing peer session must automatically re-home to updated mapping path');
+    assert.equal(macCtrl._pendingAlerts.length, 0, 'Zero split-brain alerts');
+    macSessions = await scanLocalSessions(macHome);
+    assert.equal(macSessions.size, 1, 'Only the original session exists on Mac (no phantom branch)');
+    assert.equal(macSessions.get(sid)?.header?.cwd, macDocsArticle);
+    assert.equal(
+      macSessions.get(sid)?.events?.find((e) => e.type === 'deliverables/presented')?.data?.files?.[0]?.path,
+      '/Users/mingkun/Documents/文章/公众号文章_一年只有一两把.md',
+    );
+
+    // 3. Re-bind upward/sideways to /Users/mingkun/文章 -> ALSO migrates cleanly with ZERO false fork!
+    const prevId = winCtrl.config.workspaceMappings[0].id;
+    await winCtrl.removeMapping({ id: prevId });
+    await winCtrl.handleAddMapping({ winPath: winArticle, macPath: macSiblingArticle, triggerPull: false });
+    await macCtrl.syncGlobalWorkspaceMetadata();
+    const pull3 = await macCtrl.pullAll();
+    assert.equal(pull3.sessions.summary.forkedBranches, 0);
+    assert.equal(pull3.sessions.summary.migrated, 1);
+    macSessions = await scanLocalSessions(macHome);
+    assert.equal(macSessions.size, 1);
+    assert.equal(macSessions.get(sid)?.header?.cwd, macSiblingArticle);
+    assert.equal(
+      macSessions.get(sid)?.events?.find((e) => e.type === 'deliverables/presented')?.data?.files?.[0]?.path,
+      '/Users/mingkun/文章/公众号文章_一年只有一两把.md',
+    );
+
+    // 4. Subsequent steady-state pull is up-to-date with 0 forks and 0 migrations
+    const pull4 = await macCtrl.pullAll();
+    assert.equal(pull4.sessions.summary.upToDate, 1);
+    assert.equal(pull4.sessions.summary.forkedBranches, 0);
+    assert.equal(pull4.sessions.summary.migrated, 0);
+  } finally {
+    await winCtrl.dispose();
+    await macCtrl.dispose();
+  }
+});
