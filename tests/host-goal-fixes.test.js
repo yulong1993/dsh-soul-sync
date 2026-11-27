@@ -31,6 +31,7 @@ import {
   listVaultCatalog,
   isInstallWizardSession,
   shouldAutoSyncSession,
+  buildNearFocusAnchorBlock,
 } from '../lib/session-plane.js';
 import { loadWorkspaceDeliverableState } from '../lib/deliverable-plane.js';
 import { SoulSyncController, apply as applySoulSync } from '../lib/index.js';
@@ -2524,5 +2525,301 @@ test('Zero-Git Self-Updater: POST /update/check & POST /update/apply update non-
     assert.equal(chk2.json?.localCommit, remoteSha);
   } finally {
     await ctrl.dispose();
+  }
+});
+
+test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account synchronously before preStep without mutating idle viewed tabs', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'cross-os-provider-align');
+  const macHome = path.join(caseDir, 'mac-home');
+  const winHome = path.join(caseDir, 'win-home');
+  await fs.mkdir(macHome, { recursive: true });
+  await fs.mkdir(winHome, { recursive: true });
+
+  await saveConfig(macHome, { deviceId: 'mac-dev', deviceLabel: 'MacBook', platform: 'darwin' });
+  await saveConfig(winHome, { deviceId: 'win-dev', deviceLabel: 'WinPC', platform: 'win32' });
+
+  // Build an authentic DSH 0.2.2-rc.5 session + AgentModel harness
+  function createMockHost({ dshHome, platform, apiKeyConfigured, accountConfigured, initialProvider }) {
+    const listeners = new Map();
+    const liveAgents = new Map();
+    const ctx = {
+      on(ev, fn) {
+        if (!listeners.has(ev)) listeners.set(ev, []);
+        listeners.get(ev).push(fn);
+        return () => {};
+      },
+      async emitSerial(ev, payload) {
+        for (const fn of listeners.get(ev) ?? []) {
+          await fn(payload);
+        }
+      },
+      emitSync(ev, ...args) {
+        for (const fn of listeners.get(ev) ?? []) {
+          fn(...args);
+        }
+      },
+      agents: {
+        get: (id) => liveAgents.get(id),
+      },
+      llm: {
+        listProviders: () => [
+          { id: 'deepseek-official', name: 'DeepSeek' },
+          { id: 'deepseek-account', name: 'DeepSeek Account' },
+        ],
+      },
+      credentials: {
+        describe: async (ref) => ({ configured: ref === 'DEEPSEEK_API_KEY' ? apiKeyConfigured : false, writable: true }),
+        describeRecord: async (key) => ({ configured: key === 'deepseek-account-platform/default' ? accountConfigured : false, writable: true }),
+      },
+    };
+
+    const sessionEvents = [
+      {
+        seq: 0,
+        time: 1000,
+        type: 'request/header',
+        data: {
+          header: {
+            config: {
+              provider: initialProvider,
+              model: 'deepseek-flash',
+              reasoningEffort: 'max',
+            },
+          },
+          reason: 'initial',
+        },
+      },
+    ];
+    let pendingSelection = null;
+    const session = {
+      id: 'sess-route-align-1',
+      header: { id: 'sess-route-align-1', version: 4, createdAt: 1000, cwd: platform === 'darwin' ? '/Users/test/proj' : 'D:\\proj' },
+      snapshotEvents: () => [...sessionEvents],
+      append(type, data) {
+        const ev = { seq: sessionEvents.length, time: Date.now(), type, data };
+        sessionEvents.push(ev);
+        if (type === 'model/selection') {
+          pendingSelection = { ...data };
+        }
+        ctx.emitSync('session/event', session, ev);
+        return ev;
+      },
+    };
+    const agent = {
+      id: session.id,
+      session,
+      model: {
+        current() {
+          if (pendingSelection) return { ...pendingSelection };
+          return { provider: initialProvider, model: 'deepseek-flash', reasoningEffort: 'max' };
+        },
+        select(sel) {
+          session.append('model/selection', { ...sel });
+        },
+      },
+    };
+    liveAgents.set(agent.id, agent);
+
+    const ctrl = applySoulSync(ctx, { dshHome, platform, pollIntervalMs: 0 });
+    return { ctx, ctrl, agent, session, sessionEvents };
+  }
+
+  // 1. Win (deepseek-official) -> Mac (only deepseek-account configured, no API key)
+  const macHost = createMockHost({
+    dshHome: macHome,
+    platform: 'darwin',
+    apiKeyConfigured: false,
+    accountConfigured: true,
+    initialProvider: 'deepseek-official',
+  });
+  await macHost.ctrl.readyPromise;
+  try {
+    // Merely opening/viewing the session (`agent/created`) MUST NOT append `model/selection`!
+    await macHost.ctx.emitSerial('agent/created', { agent: macHost.agent, source: 'resume' });
+    assert.equal(
+      macHost.sessionEvents.some((e) => e.type === 'model/selection'),
+      false,
+      'Passive session viewing must NOT append model/selection events (prevents split-brain forks)',
+    );
+
+    // Exact DSH turn() -> preStep() synchronous sequence:
+    // `session.append("turn/start")` fires synchronously right before `const selection = agent.model.current()`!
+    macHost.session.append('turn/start', { turn: 2 });
+    const preStepSelection = macHost.agent.model.current();
+    assert.deepEqual(preStepSelection, {
+      provider: 'deepseek-account',
+      model: 'deepseek-flash',
+      reasoningEffort: 'max',
+    });
+  } finally {
+    await macHost.ctrl.dispose();
+  }
+
+  // 2. Mac (deepseek-account) -> Win (only deepseek-official API key configured)
+  const winHost = createMockHost({
+    dshHome: winHome,
+    platform: 'win32',
+    apiKeyConfigured: true,
+    accountConfigured: false,
+    initialProvider: 'deepseek-account',
+  });
+  await winHost.ctrl.readyPromise;
+  try {
+    await winHost.ctx.emitSerial('agent/created', { agent: winHost.agent, source: 'resume' });
+    winHost.ctx.emitSync('agent/inbox/inserted', { agent: winHost.agent, message: { id: 'm1' } });
+    assert.deepEqual(winHost.agent.model.current(), {
+      provider: 'deepseek-official',
+      model: 'deepseek-flash',
+      reasoningEffort: 'max',
+    });
+
+    // Also verify `agent/request` waterfall fallback for older DSH runtimes
+    const reqConfig = await winHost.ctrl.handleAgentRequest(
+      { turn: 2, step: 1 },
+      async () => ({ provider: 'deepseek-account', model: 'deepseek-v4-pro', reasoningEffort: 'high' }),
+    );
+    assert.deepEqual(reqConfig, {
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-pro',
+      reasoningEffort: 'high',
+    });
+  } finally {
+    await winHost.ctrl.dispose();
+  }
+
+  // 3. Both routes configured on the same machine -> MUST NOT override user's intentional route choice
+  const dualHost = createMockHost({
+    dshHome: winHome,
+    platform: 'win32',
+    apiKeyConfigured: true,
+    accountConfigured: true,
+    initialProvider: 'deepseek-official',
+  });
+  await dualHost.ctrl.readyPromise;
+  try {
+    await dualHost.ctx.emitSerial('agent/created', { agent: dualHost.agent, source: 'resume' });
+    dualHost.session.append('turn/start', { turn: 2 });
+    assert.equal(dualHost.agent.model.current().provider, 'deepseek-official');
+    assert.equal(dualHost.sessionEvents.some((e) => e.type === 'model/selection'), false);
+  } finally {
+    await dualHost.ctrl.dispose();
+  }
+});
+
+test('Cross-OS continuity #2: 3-tier funnel near-focus anchor spotlights last completed sub-topic and ignores failed empty turns', async () => {
+  const caseDir = path.join(TEST_TMP_ROOT, 'cross-os-funnel-focus');
+  const winHome = path.join(caseDir, 'win-home');
+  const macHome = path.join(caseDir, 'mac-home');
+  const vaultDir = path.join(caseDir, 'vault');
+  const winWs = path.join(caseDir, 'win-articles');
+  const macWs = path.join(caseDir, 'mac-articles');
+  await fs.mkdir(winWs, { recursive: true });
+  await fs.mkdir(macWs, { recursive: true });
+  await fs.mkdir(vaultDir, { recursive: true });
+
+  const sessId = 'sess-dogfooding-focus';
+  const t0 = Date.now() - 60_000;
+  const events = [
+    // Turn 1 (early overview — should NOT clutter 3-turn near-path signpost)
+    { seq: 0, time: t0 + 100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '我们想做 AI 公众号定位分析' }] } },
+    { seq: 1, time: t0 + 200, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '定位建议聚焦工程判断力而非资讯搬运。' }] } } },
+    // Turn 2 (early overview — should NOT clutter 3-turn near-path signpost)
+    { seq: 2, time: t0 + 300, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '读一下 Anthropic 的 8 篇核心文章' }] } },
+    { seq: 3, time: t0 + 400, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '这 8 篇展示了上下文工程的演进。' }] } } },
+    // Turn 3 (N-2 signpost)
+    { seq: 4, time: t0 + 500, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '再精读这 6 篇工程博客提炼方法论' }] } },
+    { seq: 5, time: t0 + 600, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '6 篇博客共同指向简单循环加可验证反馈。' }] } } },
+    // Turn 4 (N-1 signpost)
+    { seq: 6, time: t0 + 700, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '拆解 Claude Code postmortem 事故复盘' }] } },
+    { seq: 7, time: t0 + 800, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '三次事故暴露出基础设施边界与配置漂移风险。' }] } } },
+    // Turn 5 (N active primary spotlight: dogfooding!)
+    { seq: 8, time: t0 + 900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '里面提到的 dogfooding 公开构建和内部隐藏开关怎么理解？' }] } },
+    { seq: 9, time: t0 + 1000, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '**核心落点**：真正的 dogfooding 必须跑在外部用户拿到的一致公开构建上；如果员工开着内部隐藏开关，测出来的只是特权分支，会产生致命的假安全感。' }] } } },
+    // Simulate an unanswered failed turn (e.g. transient network abort with 0 assistant/message)
+    { seq: 10, time: t0 + 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '对于我们自己做产品有什么建议？' }] } },
+    { seq: 11, time: t0 + 1200, type: 'turn/end', data: { turn: 6, reason: { kind: 'error' } } },
+  ];
+
+  // Direct unit check on buildNearFocusAnchorBlock
+  const block = buildNearFocusAnchorBlock(events, { maxTurns: 3 });
+  assert.match(block, /【近景演进路标】.*6 篇工程博客.*Claude Code postmortem.*当前焦点：.*dogfooding/);
+  assert.doesNotMatch(block, /AI 公众号定位分析/, 'Early Turn 1 must NOT dilute the 3-turn near-focus signpost');
+  assert.doesNotMatch(block, /Anthropic 的 8 篇/, 'Early Turn 2 must NOT dilute the 3-turn near-focus signpost');
+  assert.match(block, /【当前紧邻主焦点（换机前最后一轮特写）】/);
+  assert.match(block, /dogfooding 公开构建和内部隐藏开关/);
+  assert.match(block, /真正的 dogfooding 必须跑在外部用户拿到的一致公开构建上/);
+  assert.match(block, /【跨机接力延续准则】/);
+
+  // End-to-end Win -> Vault -> Mac pull -> handleAgentPreStep verification
+  const wsId = deriveWorkspaceId('文章');
+  const mappings = [{ id: wsId, title: '文章', win32: winWs, darwin: macWs }];
+  await savePassphraseKey(winHome, 'focus-pass-123');
+  await savePassphraseKey(macHome, 'focus-pass-123');
+  await saveConfig(winHome, {
+    deviceId: 'win-focus',
+    deviceLabel: 'WinDesk',
+    platform: 'win32',
+    vaultDir,
+    encryptionEnabled: true,
+    workspaceMappings: mappings,
+  });
+  await saveConfig(macHome, {
+    deviceId: 'mac-focus',
+    deviceLabel: 'MacAir',
+    platform: 'darwin',
+    vaultDir,
+    encryptionEnabled: true,
+    workspaceMappings: mappings,
+  });
+
+  await writeLocalSession(
+    winHome,
+    { type: 'session', version: 4, id: sessId, createdAt: t0, cwd: winWs, isSeeded: false, delegationDepth: 0 },
+    events.slice(0, 10),
+  );
+
+  const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', pollIntervalMs: 0 });
+  await winCtrl.reloadConfig();
+  await winCtrl.pushAll();
+  await winCtrl.dispose();
+
+  const macCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', pollIntervalMs: 0 });
+  await macCtrl.reloadConfig();
+  await macCtrl.pullAll();
+
+  try {
+    const macLocal = await scanLocalSessions(macHome);
+    const syncedRec = macLocal.get(sessId);
+    assert.ok(syncedRec, 'Mac must import the session');
+
+    const mockAgent = {
+      id: sessId,
+      session: {
+        id: sessId,
+        cwd: macWs,
+        header: syncedRec.header,
+        snapshotEvents: () => syncedRec.events,
+      },
+    };
+    const userPromptMsg = {
+      id: 'u-mac-1',
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: '对于我们自己做 AI 产品，有什么建议或帮助呢？' }],
+    };
+    const preStepDecision = await macCtrl.handleAgentPreStep(
+      { agent: mockAgent, signal: new AbortController().signal },
+      async () => ({ kind: 'enter', messages: [userPromptMsg] }),
+    );
+    assert.equal(preStepDecision.messages.length, 2);
+    const noticeMsg = preStepDecision.messages[1];
+    const noticeText = noticeMsg.content?.[0]?.text ?? '';
+    assert.match(noticeText, /【跨设备接力备注】.*WinDesk \(win32\)/);
+    assert.match(noticeText, /【近景演进路标】.*6 篇工程博客.*Claude Code postmortem.*dogfooding/);
+    assert.match(noticeText, /【当前紧邻主焦点（换机前最后一轮特写）】/);
+    assert.match(noticeText, /公开构建[\s\S]*内部隐藏开关/);
+    assert.match(noticeText, /【跨机接力延续准则】.*切勿因换机重刷系统提示而擅自拉远镜头做全篇综述/);
+  } finally {
+    await macCtrl.dispose();
   }
 });
