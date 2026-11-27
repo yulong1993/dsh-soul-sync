@@ -2528,7 +2528,7 @@ test('Zero-Git Self-Updater: POST /update/check & POST /update/apply update non-
   }
 });
 
-test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account synchronously before preStep without mutating idle viewed tabs', async () => {
+test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account via inbox/claimed & inbox/inserted with real non-reentrant Session lock, custom apiKeyEnv & account state', async () => {
   const caseDir = path.join(TEST_TMP_ROOT, 'cross-os-provider-align');
   const macHome = path.join(caseDir, 'mac-home');
   const winHome = path.join(caseDir, 'win-home');
@@ -2538,10 +2538,19 @@ test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account
   await saveConfig(macHome, { deviceId: 'mac-dev', deviceLabel: 'MacBook', platform: 'darwin' });
   await saveConfig(winHome, { deviceId: 'win-dev', deviceLabel: 'WinPC', platform: 'win32' });
 
-  // Build an authentic DSH 0.2.2-rc.5 session + AgentModel harness
-  function createMockHost({ dshHome, platform, apiKeyConfigured, accountConfigured, initialProvider }) {
+  // Build an authentic DSH 0.2.2-rc.5 session + AgentModel harness enforcing `Session.commit()` reentrancy lock!
+  function createMockHost({
+    dshHome,
+    platform,
+    apiKeyConfigured,
+    customApiKeyEnv = null,
+    accountStatus = null,
+    accountConfigured = false,
+    initialProvider,
+  }) {
     const listeners = new Map();
     const liveAgents = new Map();
+    let currentAccountStatus = accountStatus;
     const ctx = {
       on(ev, fn) {
         if (!listeners.has(ev)) listeners.set(ev, []);
@@ -2566,10 +2575,35 @@ test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account
           { id: 'deepseek-official', name: 'DeepSeek' },
           { id: 'deepseek-account', name: 'DeepSeek Account' },
         ],
+        listConfigurableProviders: () => [
+          {
+            provider: 'deepseek-official',
+            displayName: 'DeepSeek',
+            settingsNs: 'llm-deepseek-api-key',
+            settingsPath: [],
+          },
+        ],
       },
+      settings: customApiKeyEnv
+        ? {
+            describe: () => [{ ns: 'llm-deepseek-api-key', value: { apiKeyEnv: customApiKeyEnv } }],
+          }
+        : undefined,
+      deepseekAccount: currentAccountStatus !== null
+        ? {
+            getState: async () => ({ status: currentAccountStatus }),
+            setStatus: (s) => { currentAccountStatus = s; },
+          }
+        : undefined,
       credentials: {
-        describe: async (ref) => ({ configured: ref === 'DEEPSEEK_API_KEY' ? apiKeyConfigured : false, writable: true }),
-        describeRecord: async (key) => ({ configured: key === 'deepseek-account-platform/default' ? accountConfigured : false, writable: true }),
+        describe: async (ref) => ({
+          configured: ref === (customApiKeyEnv || 'DEEPSEEK_API_KEY') ? apiKeyConfigured : false,
+          writable: true,
+        }),
+        describeRecord: async (key) => ({
+          configured: key === 'deepseek-account-platform/default' ? accountConfigured : false,
+          writable: true,
+        }),
       },
     };
 
@@ -2591,18 +2625,30 @@ test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account
       },
     ];
     let pendingSelection = null;
+    let appending = false;
+    let reentrancyErrors = 0;
     const session = {
       id: 'sess-route-align-1',
       header: { id: 'sess-route-align-1', version: 4, createdAt: 1000, cwd: platform === 'darwin' ? '/Users/test/proj' : 'D:\\proj' },
       snapshotEvents: () => [...sessionEvents],
       append(type, data) {
-        const ev = { seq: sessionEvents.length, time: Date.now(), type, data };
-        sessionEvents.push(ev);
-        if (type === 'model/selection') {
-          pendingSelection = { ...data };
+        // Mirror real `@deepseek-ai/dsh-session` publicationEntry() non-reentrancy lock!
+        if (appending) {
+          reentrancyErrors += 1;
+          throw new Error('session append cannot reenter while another append is being published');
         }
-        ctx.emitSync('session/event', session, ev);
-        return ev;
+        appending = true;
+        try {
+          const ev = { seq: sessionEvents.length, time: Date.now(), type, data };
+          sessionEvents.push(ev);
+          if (type === 'model/selection') {
+            pendingSelection = { ...data };
+          }
+          ctx.emitSync('session/event', session, ev);
+          return ev;
+        } finally {
+          appending = false;
+        }
       },
     };
     const agent = {
@@ -2621,15 +2667,15 @@ test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account
     liveAgents.set(agent.id, agent);
 
     const ctrl = applySoulSync(ctx, { dshHome, platform, pollIntervalMs: 0 });
-    return { ctx, ctrl, agent, session, sessionEvents };
+    return { ctx, ctrl, agent, session, sessionEvents, getReentrancyErrors: () => reentrancyErrors };
   }
 
-  // 1. Win (deepseek-official) -> Mac (only deepseek-account configured, no API key)
+  // 1. Win (deepseek-official) -> Mac (only deepseek-account signed in, queued message via `agent/inbox/claimed`!)
   const macHost = createMockHost({
     dshHome: macHome,
     platform: 'darwin',
     apiKeyConfigured: false,
-    accountConfigured: true,
+    accountStatus: 'credential-stored',
     initialProvider: 'deepseek-official',
   });
   await macHost.ctrl.readyPromise;
@@ -2642,25 +2688,46 @@ test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account
       'Passive session viewing must NOT append model/selection events (prevents split-brain forks)',
     );
 
-    // Exact DSH turn() -> preStep() synchronous sequence:
-    // `session.append("turn/start")` fires synchronously right before `const selection = agent.model.current()`!
+    // Exact DSH turn() -> preStep() sequence with non-reentrant `session.append`:
+    // 1) `session.append('turn/start')` (must NOT reenter `session.append`!)
+    // 2) `inbox.claim()` appends `agent/inbox/spliced`, releases lock, then emits `agent/inbox/claimed`
+    // 3) `const selection = agent.model.current()`
     macHost.session.append('turn/start', { turn: 2 });
+    assert.equal(macHost.getReentrancyErrors(), 0, 'turn/start must NEVER trigger reentrant session.append');
+    macHost.session.append('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] });
+    macHost.ctx.emitSync('agent/inbox/claimed', { agent: macHost.agent, turn: 2, message: { id: 'm-queued' } });
+
     const preStepSelection = macHost.agent.model.current();
     assert.deepEqual(preStepSelection, {
       provider: 'deepseek-account',
       model: 'deepseek-flash',
       reasoningEffort: 'max',
     });
+    assert.equal(macHost.getReentrancyErrors(), 0);
+
+    // P0-1: On DSH 0.2.2+ where `agent.model.select` exists, `handleAgentRequest` MUST NOT mutate `provider`!
+    const modernReqConfig = await macHost.ctrl.handleAgentRequest(
+      { agent: macHost.agent, turn: 2, step: 1 },
+      async () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }),
+    );
+    assert.equal(modernReqConfig.provider, 'deepseek-official', 'handleAgentRequest must not mutate provider when agent.model.select exists');
+
+    // P1-1: Signing out of deepseekAccount refreshes availability so unconfigured route is no longer selected
+    macHost.ctx.deepseekAccount.setStatus('signed-out');
+    macHost.ctx.emitSync('deepseek-account/signed-out');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(macHost.ctrl._deepSeekRouteAvailability['deepseek-account'], false);
   } finally {
     await macHost.ctrl.dispose();
   }
 
-  // 2. Mac (deepseek-account) -> Win (only deepseek-official API key configured)
+  // 2. Mac (deepseek-account) -> Win with CUSTOM `apiKeyEnv: 'CUSTOM_DS_API_KEY'`
   const winHost = createMockHost({
     dshHome: winHome,
     platform: 'win32',
     apiKeyConfigured: true,
-    accountConfigured: false,
+    customApiKeyEnv: 'CUSTOM_DS_API_KEY',
+    accountStatus: 'signed-out',
     initialProvider: 'deepseek-account',
   });
   await winHost.ctrl.readyPromise;
@@ -2673,12 +2740,12 @@ test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account
       reasoningEffort: 'max',
     });
 
-    // Also verify `agent/request` waterfall fallback for older DSH runtimes
-    const reqConfig = await winHost.ctrl.handleAgentRequest(
-      { turn: 2, step: 1 },
+    // Legacy DSH runtime (no `agent.model`) fallback via `agent/request`
+    const legacyReqConfig = await winHost.ctrl.handleAgentRequest(
+      { agent: { id: 'legacy-agent' }, turn: 2, step: 1 },
       async () => ({ provider: 'deepseek-account', model: 'deepseek-v4-pro', reasoningEffort: 'high' }),
     );
-    assert.deepEqual(reqConfig, {
+    assert.deepEqual(legacyReqConfig, {
       provider: 'deepseek-official',
       model: 'deepseek-v4-pro',
       reasoningEffort: 'high',
@@ -2692,24 +2759,80 @@ test('Cross-OS continuity #1: auto-aligns deepseek-official <-> deepseek-account
     dshHome: winHome,
     platform: 'win32',
     apiKeyConfigured: true,
-    accountConfigured: true,
+    accountStatus: 'credential-stored',
     initialProvider: 'deepseek-official',
   });
   await dualHost.ctrl.readyPromise;
   try {
     await dualHost.ctx.emitSerial('agent/created', { agent: dualHost.agent, source: 'resume' });
-    dualHost.session.append('turn/start', { turn: 2 });
+    dualHost.ctx.emitSync('agent/inbox/claimed', { agent: dualHost.agent, turn: 2, message: { id: 'm2' } });
     assert.equal(dualHost.agent.model.current().provider, 'deepseek-official');
     assert.equal(dualHost.sessionEvents.some((e) => e.type === 'model/selection'), false);
   } finally {
     await dualHost.ctrl.dispose();
   }
+
+  // 4. REAL `@deepseek-ai/dsh-session` SessionStore integration: verify `turn/start` + `agent/inbox/claimed`
+  //    triggers zero `session append cannot reenter` exceptions on an actual DSH `Session` instance!
+  if (HAS_REAL_DSH_HOST_PKGS) {
+    const { Context } = await importRealDshPkg('@deepseek-ai/cordis');
+    const { SessionStore } = await importRealDshPkg('@deepseek-ai/dsh-session');
+    const { SessionProjectionRegistry } = await importRealDshPkg('@deepseek-ai/dsh-session-projection');
+    const realCtx = new Context();
+    await Promise.all([
+      realCtx.plugin(SessionProjectionRegistry),
+      realCtx.plugin(SessionStore),
+    ]);
+    try {
+      const realSession = realCtx.sessions.prepare('sess-real-reentrancy', { meta: { cwd: winHome } });
+      const detachSess = realCtx.sessions.enter(realSession);
+      realCtx.sessions.announce(realSession);
+      let recordedModel = { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'max' };
+      const realAgent = {
+        id: realSession.id,
+        session: realSession,
+        model: {
+          current: () => ({ ...recordedModel }),
+          select: (sel) => {
+            realSession.append('model/selection', { ...sel });
+            recordedModel = { ...sel };
+          },
+        },
+      };
+      realCtx.agents = { get: (id) => (id === realAgent.id ? realAgent : undefined) };
+      const realCtrl = applySoulSync(realCtx, {
+        dshHome: macHome,
+        platform: 'darwin',
+        pollIntervalMs: 0,
+        deepSeekRouteAvailability: { 'deepseek-official': false, 'deepseek-account': true },
+      });
+      await realCtrl.readyPromise;
+      try {
+        // Real `Session.append` sets `entry.appending = true` during `session/event` dispatch
+        assert.doesNotThrow(() => {
+          realSession.append('turn/start', { turn: 1 });
+        });
+        realCtx.emit('agent/inbox/claimed', { agent: realAgent, turn: 1, message: { id: 'm-real' } });
+        assert.equal(realAgent.model.current().provider, 'deepseek-account');
+        assert.equal(
+          realSession.snapshotEvents().some((e) => e.type === 'model/selection' && e.data?.provider === 'deepseek-account'),
+          true,
+        );
+      } finally {
+        await realCtrl.dispose();
+        detachSess();
+      }
+    } finally {
+      await realCtx.fiber?.dispose?.();
+    }
+  }
 });
 
-test('Cross-OS continuity #2: 3-tier funnel near-focus anchor spotlights last completed sub-topic and ignores failed empty turns', async () => {
+test('Cross-OS continuity #2: 3-tier funnel near-focus anchor handles multi-step tool turns, code-only messages, pre-admission error rollback, same-OS handoff & compact-checkpoint', async () => {
   const caseDir = path.join(TEST_TMP_ROOT, 'cross-os-funnel-focus');
   const winHome = path.join(caseDir, 'win-home');
   const macHome = path.join(caseDir, 'mac-home');
+  const mac2Home = path.join(caseDir, 'mac2-home');
   const vaultDir = path.join(caseDir, 'vault');
   const winWs = path.join(caseDir, 'win-articles');
   const macWs = path.join(caseDir, 'mac-articles');
@@ -2719,11 +2842,11 @@ test('Cross-OS continuity #2: 3-tier funnel near-focus anchor spotlights last co
 
   const sessId = 'sess-dogfooding-focus';
   const t0 = Date.now() - 60_000;
+  const longPreamble = `好的，我先帮你读取工作区里的六篇博客原文并逐段比对目录结构（${'检查文件列表与引用索引，'.repeat(22)}请稍候）……`;
   const events = [
-    // Turn 1 (early overview — should NOT clutter 3-turn near-path signpost)
+    // Turn 1 & 2 (early overview — should NOT clutter 3-turn near-path signpost)
     { seq: 0, time: t0 + 100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '我们想做 AI 公众号定位分析' }] } },
     { seq: 1, time: t0 + 200, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '定位建议聚焦工程判断力而非资讯搬运。' }] } } },
-    // Turn 2 (early overview — should NOT clutter 3-turn near-path signpost)
     { seq: 2, time: t0 + 300, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '读一下 Anthropic 的 8 篇核心文章' }] } },
     { seq: 3, time: t0 + 400, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '这 8 篇展示了上下文工程的演进。' }] } } },
     // Turn 3 (N-2 signpost)
@@ -2732,50 +2855,51 @@ test('Cross-OS continuity #2: 3-tier funnel near-focus anchor spotlights last co
     // Turn 4 (N-1 signpost)
     { seq: 6, time: t0 + 700, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '拆解 Claude Code postmortem 事故复盘' }] } },
     { seq: 7, time: t0 + 800, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '三次事故暴露出基础设施边界与配置漂移风险。' }] } } },
-    // Turn 5 (N active primary spotlight: dogfooding!)
+    // Turn 5 (N active primary spotlight — multi-step tool turn where Step 1 has >250 chars preamble and Step 2 has final conclusion!)
     { seq: 8, time: t0 + 900, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '里面提到的 dogfooding 公开构建和内部隐藏开关怎么理解？' }] } },
-    { seq: 9, time: t0 + 1000, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '**核心落点**：真正的 dogfooding 必须跑在外部用户拿到的一致公开构建上；如果员工开着内部隐藏开关，测出来的只是特权分支，会产生致命的假安全感。' }] } } },
-    // Simulate an unanswered failed turn (e.g. transient network abort with 0 assistant/message)
-    { seq: 10, time: t0 + 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '对于我们自己做产品有什么建议？' }] } },
-    { seq: 11, time: t0 + 1200, type: 'turn/end', data: { turn: 6, reason: { kind: 'error' } } },
+    { seq: 9, time: t0 + 950, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: longPreamble }, { type: 'tool-call', id: 'tc1', name: 'read_file', arguments: '{}' }] } } },
+    { seq: 10, time: t0 + 1000, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '**核心落点**：真正的 dogfooding 必须跑在外部用户拿到的一致公开构建上；如果员工开着内部隐藏开关，测出来的只是特权分支，会产生致命的假安全感。' }] } } },
+    // Unanswered failed turn (0 assistant/message)
+    { seq: 11, time: t0 + 1100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '对于我们自己做产品有什么建议？' }] } },
+    { seq: 12, time: t0 + 1200, type: 'turn/end', data: { turn: 6, reason: { kind: 'error' } } },
   ];
 
-  // Direct unit check on buildNearFocusAnchorBlock
+  // 1. Multi-step tool turn MUST capture Step 2's final conclusion, NOT Step 1's >250-char preamble!
   const block = buildNearFocusAnchorBlock(events, { maxTurns: 3 });
   assert.match(block, /【近景演进路标】.*6 篇工程博客.*Claude Code postmortem.*当前焦点：.*dogfooding/);
-  assert.doesNotMatch(block, /AI 公众号定位分析/, 'Early Turn 1 must NOT dilute the 3-turn near-focus signpost');
-  assert.doesNotMatch(block, /Anthropic 的 8 篇/, 'Early Turn 2 must NOT dilute the 3-turn near-focus signpost');
-  assert.match(block, /【当前紧邻主焦点（换机前最后一轮特写）】/);
-  assert.match(block, /dogfooding 公开构建和内部隐藏开关/);
+  assert.doesNotMatch(block, /AI 公众号定位分析/);
+  assert.doesNotMatch(block, /先帮你读取工作区里的六篇博客原文/);
   assert.match(block, /真正的 dogfooding 必须跑在外部用户拿到的一致公开构建上/);
-  assert.match(block, /【跨机接力延续准则】/);
 
-  // End-to-end Win -> Vault -> Mac pull -> handleAgentPreStep verification
+  // 2. Pure fenced-code messages MUST NEVER produce empty `「」` quotes!
+  const codeOnlyBlock = buildNearFocusAnchorBlock([
+    { seq: 0, time: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '```python\ndef calc_sharpe(ret):\n    return ret.mean() / ret.std()\n```' }] } },
+    { seq: 1, time: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '```python\nreturn (ret.mean() / ret.std()) * (252 ** 0.5)\n```' }] } } },
+  ]);
+  assert.doesNotMatch(codeOnlyBlock, /「」/);
+  assert.match(codeOnlyBlock, /def calc_sharpe/);
+  assert.match(codeOnlyBlock, /252 \*\* 0\.5/);
+
+  // 3. Pure `compact-checkpoint` session fallback
+  const ckptBlock = buildNearFocusAnchorBlock([
+    { seq: 0, time: 1, type: 'user/message', data: { source: { kind: 'compact-checkpoint' }, content: [{ type: 'text', text: '## 阶段交接\n当前正在推进 dogfooding 灰度发布门禁设计。' }] } },
+  ]);
+  assert.match(ckptBlock, /【当前紧邻主焦点（压缩交接摘要）】[\s\S]*dogfooding 灰度发布门禁设计/);
+
+  // 4. End-to-end Win -> Vault -> Mac pull -> pre-admission turn error rollback + retry -> Mac2 same-OS handoff
   const wsId = deriveWorkspaceId('文章');
   const mappings = [{ id: wsId, title: '文章', win32: winWs, darwin: macWs }];
   await savePassphraseKey(winHome, 'focus-pass-123');
   await savePassphraseKey(macHome, 'focus-pass-123');
-  await saveConfig(winHome, {
-    deviceId: 'win-focus',
-    deviceLabel: 'WinDesk',
-    platform: 'win32',
-    vaultDir,
-    encryptionEnabled: true,
-    workspaceMappings: mappings,
-  });
-  await saveConfig(macHome, {
-    deviceId: 'mac-focus',
-    deviceLabel: 'MacAir',
-    platform: 'darwin',
-    vaultDir,
-    encryptionEnabled: true,
-    workspaceMappings: mappings,
-  });
+  await savePassphraseKey(mac2Home, 'focus-pass-123');
+  await saveConfig(winHome, { deviceId: 'win-focus', deviceLabel: 'WinDesk', platform: 'win32', vaultDir, encryptionEnabled: true, workspaceMappings: mappings });
+  await saveConfig(macHome, { deviceId: 'mac-focus', deviceLabel: 'MacAir', platform: 'darwin', vaultDir, encryptionEnabled: true, workspaceMappings: mappings });
+  await saveConfig(mac2Home, { deviceId: 'mac2-focus', deviceLabel: 'MacStudio', platform: 'darwin', vaultDir, encryptionEnabled: true, workspaceMappings: mappings });
 
   await writeLocalSession(
     winHome,
     { type: 'session', version: 4, id: sessId, createdAt: t0, cwd: winWs, isSeeded: false, delegationDepth: 0 },
-    events.slice(0, 10),
+    events.slice(0, 11),
   );
 
   const winCtrl = new SoulSyncController(null, { dshHome: winHome, platform: 'win32', pollIntervalMs: 0 });
@@ -2790,36 +2914,183 @@ test('Cross-OS continuity #2: 3-tier funnel near-focus anchor spotlights last co
   try {
     const macLocal = await scanLocalSessions(macHome);
     const syncedRec = macLocal.get(sessId);
-    assert.ok(syncedRec, 'Mac must import the session');
-
-    const mockAgent = {
+    const liveLog = [...syncedRec.events];
+    const mockSession = {
       id: sessId,
-      session: {
-        id: sessId,
-        cwd: macWs,
-        header: syncedRec.header,
-        snapshotEvents: () => syncedRec.events,
-      },
+      cwd: macWs,
+      header: syncedRec.header,
+      snapshotEvents: () => [...liveLog],
     };
+    const mockAgent = { id: sessId, session: mockSession };
     const userPromptMsg = {
       id: 'u-mac-1',
       role: 'user',
       source: { kind: 'user' },
       content: [{ type: 'text', text: '对于我们自己做 AI 产品，有什么建议或帮助呢？' }],
     };
-    const preStepDecision = await macCtrl.handleAgentPreStep(
+
+    macCtrl._pushAlert({ kind: 'file-conflict', sessionId: sessId, text: '测试冲突告警' });
+
+    // Attempt 1: `handleAgentPreStep` runs, then `prepareRequest` fails BEFORE `session.append('user/message')` -> `turn/end` fires!
+    const dec1 = await macCtrl.handleAgentPreStep(
       { agent: mockAgent, signal: new AbortController().signal },
       async () => ({ kind: 'enter', messages: [userPromptMsg] }),
     );
-    assert.equal(preStepDecision.messages.length, 2);
-    const noticeMsg = preStepDecision.messages[1];
-    const noticeText = noticeMsg.content?.[0]?.text ?? '';
-    assert.match(noticeText, /【跨设备接力备注】.*WinDesk \(win32\)/);
-    assert.match(noticeText, /【近景演进路标】.*6 篇工程博客.*Claude Code postmortem.*dogfooding/);
-    assert.match(noticeText, /【当前紧邻主焦点（换机前最后一轮特写）】/);
-    assert.match(noticeText, /公开构建[\s\S]*内部隐藏开关/);
-    assert.match(noticeText, /【跨机接力延续准则】.*切勿因换机重刷系统提示而擅自拉远镜头做全篇综述/);
+    assert.equal(dec1.messages.length, 2);
+    await macCtrl.handleSessionEvent(mockSession, { seq: liveLog.length, time: Date.now(), type: 'turn/end', data: { turn: 6, reason: { kind: 'error' } } });
+
+    // Retry Attempt 2: Because Attempt 1 never appended `dec1.messages[1]` to `session`, BOTH migration anchor AND alert were rolled back!
+    const dec2 = await macCtrl.handleAgentPreStep(
+      { agent: mockAgent, signal: new AbortController().signal },
+      async () => ({ kind: 'enter', messages: [userPromptMsg] }),
+    );
+    assert.equal(dec2.messages.length, 2, 'Pre-admission turn error must roll back migration anchor & alerts for retry');
+    const retryText = dec2.messages[1].content?.[0]?.text ?? '';
+    assert.match(retryText, /【跨设备接力备注】.*WinDesk \(win32\)/);
+    assert.match(retryText, /真正的 dogfooding 必须跑在外部用户拿到的一致公开构建上/);
+    assert.match(retryText, /测试冲突告警/);
+
+    // Now simulate `step()` committing `dec2.messages[1]` to `session` -> subsequent turn must NOT re-inject!
+    const committedNotice = { seq: liveLog.length, time: Date.now(), type: 'user/message', data: dec2.messages[1] };
+    liveLog.push(committedNotice);
+    await macCtrl.handleSessionEvent(mockSession, committedNotice);
+    await macCtrl.handleSessionEvent(mockSession, { seq: liveLog.length, time: Date.now(), type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } });
+
+    const dec3 = await macCtrl.handleAgentPreStep(
+      { agent: mockAgent, signal: new AbortController().signal },
+      async () => ({ kind: 'enter', messages: [userPromptMsg] }),
+    );
+    assert.equal(dec3.messages.length, 1, 'Once committed to session log, migration anchor must not repeat');
   } finally {
     await macCtrl.dispose();
   }
+
+  // 5. Same-OS multi-device (`MacAir -> MacStudio`) also records cross-device migration anchor!
+  const sameOsSid = 'sess-same-os-mac';
+  await writeLocalSession(
+    macHome,
+    { type: 'session', version: 4, id: sameOsSid, createdAt: t0 + 5000, cwd: macWs, isSeeded: false, delegationDepth: 0 },
+    [
+      { seq: 0, time: t0 + 5100, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '在 MacBook Air 上起草提纲' }] } },
+      { seq: 1, time: t0 + 5200, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '提纲第一部分聚焦工程反馈闭环。' }] } } },
+    ],
+  );
+  const macPushCtrl = new SoulSyncController(null, { dshHome: macHome, platform: 'darwin', pollIntervalMs: 0 });
+  await macPushCtrl.reloadConfig();
+  await macPushCtrl.pushAll();
+  await macPushCtrl.dispose();
+
+  const mac2Ctrl = new SoulSyncController(null, { dshHome: mac2Home, platform: 'darwin', pollIntervalMs: 0 });
+  await mac2Ctrl.reloadConfig();
+  await mac2Ctrl.pullAll();
+  try {
+    const mac2Local = await scanLocalSessions(mac2Home);
+    const rec2 = mac2Local.get(sameOsSid);
+    const sameOsDec = await mac2Ctrl.handleAgentPreStep(
+      { agent: { id: sameOsSid, session: { id: sameOsSid, cwd: macWs, header: rec2.header, snapshotEvents: () => rec2.events } }, signal: new AbortController().signal },
+      async () => ({ kind: 'enter', messages: [{ id: 'u-m2', role: 'user', content: [{ type: 'text', text: '继续' }] }] }),
+    );
+    assert.equal(sameOsDec.messages.length, 2);
+    assert.match(sameOsDec.messages[1].content?.[0]?.text ?? '', /另一台设备 MacAir \(darwin\)/);
+    assert.match(sameOsDec.messages[1].content?.[0]?.text ?? '', /工程反馈闭环/);
+  } finally {
+    await mac2Ctrl.dispose();
+  }
+});
+
+test('Self-updater guards: blocks git-to-tarball fallthrough corruption, detects localAhead commits, and exposes update in CLI help', async () => {
+  const { promisify } = await import('node:util');
+  const { execFile } = await import('node:child_process');
+  const execFileAsync = promisify(execFile);
+
+  const caseDir = path.join(TEST_TMP_ROOT, 'self-updater-git-guards');
+  const remoteGitDir = path.join(caseDir, 'remote.git');
+  const localGitDir = path.join(caseDir, 'local-clone');
+  const dshHome = path.join(caseDir, 'dsh-home');
+  await fs.mkdir(caseDir, { recursive: true });
+  await fs.mkdir(dshHome, { recursive: true });
+
+  await execFileAsync('git', ['init', '--bare', remoteGitDir]);
+  await execFileAsync('git', ['clone', remoteGitDir, localGitDir]);
+  await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: localGitDir });
+  await execFileAsync('git', ['config', 'user.name', 'Tester'], { cwd: localGitDir });
+
+  await fs.writeFile(path.join(localGitDir, 'package.json'), JSON.stringify({ name: 'dsh-soul-sync', version: '0.1.0' }), 'utf8');
+  await execFileAsync('git', ['add', '.'], { cwd: localGitDir });
+  await execFileAsync('git', ['commit', '-m', 'base commit'], { cwd: localGitDir });
+  const { stdout: baseShaOut } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: localGitDir });
+  const baseSha = baseShaOut.trim();
+
+  // Create a newer local commit AHEAD of `baseSha`
+  await fs.writeFile(path.join(localGitDir, 'package.json'), JSON.stringify({ name: 'dsh-soul-sync', version: '0.2.0' }), 'utf8');
+  await execFileAsync('git', ['add', '.'], { cwd: localGitDir });
+  await execFileAsync('git', ['commit', '-m', 'local ahead commit'], { cwd: localGitDir });
+
+  // 1. When local HEAD is strictly ahead of remote (`baseSha`), `checkRemoteUpdate` MUST report `hasUpdate: false` & `localAhead: true`!
+  const aheadFetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ sha: baseSha, commit: { message: 'base commit' } }),
+  });
+  const ctrlAhead = new SoulSyncController(null, {
+    dshHome,
+    platform: 'win32',
+    pollIntervalMs: 0,
+    repoRoot: localGitDir,
+    updateFetchImpl: aheadFetch,
+  });
+  await ctrlAhead.reloadConfig();
+  try {
+    const chk = await ctrlAhead.checkSelfUpdate();
+    assert.equal(chk.hasUpdate, false);
+    assert.equal(chk.localAhead, true);
+    const app = await ctrlAhead.applySelfUpdate();
+    assert.equal(app.updated, false);
+    assert.equal(app.alreadyLatest, true);
+  } finally {
+    await ctrlAhead.dispose();
+  }
+
+  // 2. When remote has a non-existent/diverged SHA and `.git` exists, `applySelfUpdate` MUST return `ok: false`
+  //    and NEVER call `codeload.github.com` tarball download (which would corrupt the clean git working tree)!
+  let tarballCalled = false;
+  const divergedSha = 'b'.repeat(40);
+  const divergedFetch = async (url) => {
+    if (String(url).includes('codeload.github.com')) {
+      tarballCalled = true;
+      throw new Error('Should NEVER fall through to tarball on a git repository!');
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ sha: divergedSha, commit: { message: 'diverged commit' } }),
+    };
+  };
+  const ctrlDiv = new SoulSyncController(null, {
+    dshHome,
+    platform: 'win32',
+    pollIntervalMs: 0,
+    repoRoot: localGitDir,
+    updateFetchImpl: divergedFetch,
+  });
+  await ctrlDiv.reloadConfig();
+  try {
+    const res = await ctrlDiv.applySelfUpdate();
+    assert.equal(res.ok, false);
+    assert.equal(res.updated, false);
+    assert.equal(tarballCalled, false, 'Git repo failure must NEVER fall through to tarball');
+  } finally {
+    await ctrlDiv.dispose();
+  }
+
+  // 3. CLI `--help` includes `update` subcommand
+  const outLines = [];
+  const code = await runCli(['--help'], {
+    stdout: (s) => outLines.push(s),
+    stderr: () => {},
+    env: {},
+    isTTY: false,
+  });
+  assert.equal(code, 0);
+  assert.match(outLines.join(''), /\bupdate\b/);
 });

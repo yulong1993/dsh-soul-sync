@@ -13,7 +13,7 @@
 
 ### 第 1 步：准备或更新本机 `dsh-soul-sync` 插件目录（无需我装 Git）
 - 先检查当前工作区或固定目录（Windows 优先看 `$HOME\Documents\dsh-soul-sync`；macOS 优先看 `~/Documents/dsh-soul-sync` 或 `~/Documents/deepseek-harness/dsh-soul-sync`）是否已有 `dsh-soul-sync`（含 `scripts/install-win.ps1`、`scripts/install-mac.sh` 与 `bin/dsh-soul.js`）。
-- 如果本机还没有：无需让我手动下载，请直接替我从公开仓库 `https://github.com/yulong1993/dsh-soul-sync` 自动拉取到我的「文档」固定目录（有 `git` 可 `git clone https://github.com/yulong1993/dsh-soul-sync.git`；没装 `git` 可直接用系统自带的 `curl -L https://codeload.github.com/yulong1993/dsh-soul-sync/tar.gz/refs/heads/main` 配合 `tar -xzf` 解压成 `dsh-soul-sync` 文件夹），并提醒我日后不要删除该文件夹。
+- 如果本机还没有：无需让我手动下载，请直接替我从公开仓库 `https://github.com/yulong1993/dsh-soul-sync` 自动拉取到我的「文档」固定目录（有 `git` 可 `git clone https://github.com/yulong1993/dsh-soul-sync.git`；没装 `git` 可直接用系统自带的下载命令——Windows 用 `curl.exe -L`，macOS 用 `curl -L`——下载 `https://codeload.github.com/yulong1993/dsh-soul-sync/tar.gz/refs/heads/main` 配合 `tar -xzf` 解压成 `dsh-soul-sync` 文件夹），并提醒我日后不要删除该文件夹。
 - 如果本机已经有了且含 `.git` 目录，请顺手先 `git pull` 更新到最新版。
 
 ### 第 2 步：用大白话一次性向我确认 2 个核心问题（不要分开追问太多轮）

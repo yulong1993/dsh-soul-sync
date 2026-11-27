@@ -401,6 +401,7 @@ function formatHelpText() {
     '  config    查看或修改同步配额、文件夹对应模式（folderMatchMode）与同步范围（syncScope）',
     '  doctor    全面自检配置、金库读写、密钥、技能、规则块与 DSH 插件注册状态',
     '  watch     启动轻量级后台守护模式，自动监测并周期备份会话与产出物',
+    '  update    一键在线检查并更新插件至 GitHub 最新版（支持零 Git 环境）',
     '  disconnect 断开当前防灾金库连接并暂停同步（保留本机对话与文件）',
     '  reset     重置本机 soul-sync 配置与密钥（保留本机对话、文件与凭据）',
     '  uninstall 一键卸载插件注册、技能、规则块与本机配置（绝不删本机对话、文件与插件源目录）',
